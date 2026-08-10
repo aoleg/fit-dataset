@@ -140,6 +140,95 @@ def test_needed_area_matches_spec_table():
     assert k.needed_area(512, "1:1") == 198218
 
 
+# ---------------------------------------------------------------------------
+# Bucket merging
+# ---------------------------------------------------------------------------
+
+def _mk(name, w, h):
+    """A Result placed in its natural bucket, as analyse() would leave it."""
+    from pathlib import Path
+    res = k.Result(path=Path(name), name=name)
+    res.src_w, res.src_h, res.src_ar = w, h, w / h
+    res.family = k.assign_family(res.src_ar)
+    fit = k.assign_tier(w, h, res.family)
+    assert fit is not None, (name, w, h)
+    k.place(res, fit[0], fit[1])
+    res.status = k.ST_ACCEPTED
+    return res
+
+
+def test_orientation_is_never_flipped():
+    portrait, square, landscape = (912, 1136), (1024, 1024), (1136, 912)
+    assert k.orientation_ok(0.75, portrait)
+    assert k.orientation_ok(0.75, square)
+    assert not k.orientation_ok(0.75, landscape)
+    assert k.orientation_ok(1.5, landscape)
+    assert k.orientation_ok(1.5, square)
+    assert not k.orientation_ok(1.5, portrait)
+    assert k.orientation_ok(1.0, portrait) and k.orientation_ok(1.0, landscape)
+
+
+def test_ar_distance_is_symmetric_in_log_space():
+    """0.8 -> 1:1 and 1.25 -> 1:1 are the same move mirrored, so they must
+    measure the same. Linear ratio distance gets this wrong (0.20 vs 0.25)."""
+    square = (1024, 1024)
+    assert abs(k.ar_distance(0.8, square) - k.ar_distance(1.25, square)) < 1e-9
+    assert abs(0.8 - 1.0) != abs(1.25 - 1.0)          # the flaw being avoided
+
+
+def test_crop_cap_refuses_a_brutal_move():
+    tall = _mk("phone.png", 1080, 2340)             # 9:16, AR 0.46
+    ok, why = k.can_accept(tall, k.bucket_for(1024, "4:5"))
+    assert not ok and why == "crop", why
+    ok, _ = k.can_accept(tall, k.bucket_for(1024, "2:3"))
+    assert ok                                        # 31%, under the cap
+
+
+def test_rescue_merges_an_orphan_512_tier():
+    """The 5/3/1/1/1 shape that has no healthy bucket to aim at."""
+    images = ([_mk(f"sq_{i}.jpg", 600, 600) for i in range(5)] +
+              [_mk(f"cam_{i}.jpg", 640, 480) for i in range(3)] +
+              [_mk("tall_916.jpg", 400, 700),
+               _mk("tall_23.jpg", 480, 720),
+               _mk("tall_45.jpg", 450, 580)])
+    assert all(r.tier == 512 for r in images)
+    assert max(k.bucket_counts(images).values()) == 5      # nothing healthy
+
+    moves, unmerged, _before, after = k.plan_merge(images)
+
+    assert after[(512, (512, 512))] == 10
+    assert after[(512, (384, 672))] == 1                   # 43% crop, left alone
+    assert len(moves) == 5
+    assert [r.name for r, _why in unmerged] == ["tall_916.jpg"]
+
+
+def test_merge_never_flips_orientation():
+    images = ([_mk(f"port_{i}.jpg", 3024, 4032) for i in range(3)] +
+              [_mk(f"land_{i}.jpg", 4032, 3024) for i in range(9)])
+    k.plan_merge(images)
+    for r in images:
+        assert k.orientation_ok(r.src_ar, r.bucket), r.name
+
+
+def test_healthy_buckets_are_left_alone():
+    images = [_mk(f"land_{i}.jpg", 4032, 3024) for i in range(12)]
+    before = k.bucket_counts(images)
+    moves, unmerged, _b, after = k.plan_merge(images)
+    assert not moves and not unmerged
+    assert dict(before) == after
+
+
+def test_too_few_images_cannot_be_rescued():
+    """Five images cannot make a bucket of eight, so nothing is cropped for
+    nothing."""
+    images = [_mk("sq.jpg", 600, 600), _mk("cam.jpg", 640, 480),
+              _mk("t1.jpg", 480, 720), _mk("t2.jpg", 450, 580),
+              _mk("t3.jpg", 400, 700)]
+    moves, unmerged, _b, _a = k.plan_merge(images)
+    assert not moves
+    assert len(unmerged) == 5
+
+
 def main():
     tests = [v for name, v in sorted(globals().items()) if name.startswith("test_")]
     failed = 0
