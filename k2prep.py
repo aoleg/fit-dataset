@@ -16,6 +16,7 @@ Single file by design; see SPEC.md section 2.
 from __future__ import annotations
 
 import argparse
+import json
 import math
 import os
 import shutil
@@ -142,6 +143,36 @@ B_BANDS = [(1.05, 10), (1.10, 9), (1.15, 8), (1.20, 7), (1.30, 6),
 # histogram, and adjust these numbers before trusting --threshold to act on D.
 D_BANDS = [(0.070, 10), (0.055, 9), (0.045, 8), (0.035, 7), (0.026, 6),
            (0.019, 5), (0.013, 4), (0.008, 3), (0.004, 2)]
+
+# --- rendered-image bands (the default, two-pass scoring) -------------------
+#
+# Quality is resolution-dependent, so measuring the source tells you about
+# pixels the trainer never sees. A 4000x6000 photo at JPEG q60 is a poor image
+# at full size and an excellent one at 1248x832: the 4x downscale averages the
+# 8x8 block edges away entirely. Scored on the source it fails a threshold of 6;
+# scored on the image that actually reaches the VAE it passes comfortably. The
+# reverse holds too - a 1200x800 source lands in the same bucket at roughly 1:1,
+# so every artifact it has survives at full strength.
+#
+# These bands are therefore measured on the rendered image and are NOT
+# interchangeable with the source bands above. They were fitted to give a usable
+# spread over a 29-image reference folder plus a controlled quality sweep; they
+# are as uncalibrated as the source bands and deserve the same scepticism.
+
+# B_rendered: normalised amplitude of surviving block structure. A controlled
+# sweep at scale 0.96 reads 0.009 at q95 and 0.060 at q30; the same source at
+# scale 0.25 reads nothing at all, because there is nothing left to read.
+B_RENDERED_BANDS = [(0.010, 10), (0.014, 9), (0.018, 8), (0.023, 7), (0.030, 6),
+                    (0.038, 5), (0.048, 4), (0.060, 3), (0.075, 2)]
+
+# D_rendered: same detail formula, on the rendered image. Values run higher than
+# the source equivalent because a clean Lanczos downscale concentrates detail.
+D_RENDERED_BANDS = [(0.140, 10), (0.110, 9), (0.085, 8), (0.065, 7), (0.048, 6),
+                    (0.035, 5), (0.025, 4), (0.017, 3), (0.010, 2)]
+
+# Below this many output pixels per source block, the 8x8 grid is past the
+# resolution limit of the rendered image and carries no recoverable signal.
+MIN_BLOCK_PERIOD = 3.0
 
 # Standard IJG luma quantization table, natural (row-major) order, which is what
 # Pillow's Image.quantization returns.
@@ -343,6 +374,55 @@ def score_b(ratio: float) -> int:
     return 1
 
 
+def block_period_energy(luma: Image.Image, period: float) -> float | None:
+    """Strength of periodic edge structure at an arbitrary, non-integer period.
+
+    The source-image metric above can assume period 8 and a known phase. On a
+    rendered image neither holds: an 8px source block lands every 8*scale output
+    pixels, and cropping shifts the phase. So instead of averaging aligned
+    columns, take the magnitude of a single DFT bin of the column-difference
+    profile at the frequency the block grid would occupy. Magnitude is
+    phase-independent, which is exactly what is needed here, and it works at
+    fractional periods.
+
+    Returns None when the period is past the resolution limit - which is not a
+    failure, it is the metric correctly reporting that the downscale destroyed
+    the artifacts.
+    """
+    if period < MIN_BLOCK_PERIOD:
+        return None
+    arr = np.asarray(luma, dtype=np.float32)
+    best = None
+    for axis in (arr, arr.T):
+        diff = np.abs(axis[:, 1:] - axis[:, :-1]).mean(axis=0)
+        n = diff.size
+        if n < 32 or period > n / 4:
+            continue
+        mean = float(diff.mean())
+        if mean <= EPS:
+            continue
+        centred = diff - mean
+        x = np.arange(n)
+        amp = 2.0 * abs(complex(np.sum(centred * np.exp(-2j * math.pi * x / period)))) / n
+        value = float(amp / mean)
+        best = value if best is None else max(best, value)
+    return best
+
+
+def score_b_rendered(ratio: float) -> int:
+    for hi, s in B_RENDERED_BANDS:
+        if ratio <= hi:
+            return s
+    return 1
+
+
+def score_d_rendered(ratio: float) -> int:
+    for lo, s in D_RENDERED_BANDS:
+        if ratio >= lo:
+            return s
+    return 1
+
+
 # ---------------------------------------------------------------------------
 # 6.3  D - detail
 # ---------------------------------------------------------------------------
@@ -415,6 +495,33 @@ def load_source(path: Path) -> tuple[Image.Image, str, dict | None]:
     return img, fmt, qtables
 
 
+def read_geometry(path: Path) -> tuple[int, int, str, dict | None]:
+    """Displayed dimensions, format and quantization tables, without decoding.
+
+    Two-pass scoring only needs geometry up front - the pixels are not looked at
+    until the image is rendered - so the whole first pass runs on headers. The
+    orientation tag is applied by hand rather than through exif_transpose, which
+    would force a decode to produce an image nobody wants.
+    """
+    with Image.open(path) as img:
+        fmt = img.format or ""
+        n_frames = getattr(img, "n_frames", 1)
+        if n_frames and n_frames > 1:
+            raise ValueError(
+                f"animated {fmt or 'image'} rejected ({n_frames} frames); "
+                "k2prep processes still images only"
+            )
+        w, h = img.size
+        qtables = getattr(img, "quantization", None)
+        try:
+            orientation = img.getexif().get(274, 1) or 1
+        except Exception:
+            orientation = 1
+    if orientation in (5, 6, 7, 8):       # the transposing orientations
+        w, h = h, w
+    return w, h, fmt, qtables
+
+
 def _metric_crop(luma: Image.Image) -> Image.Image:
     """Centre crop to at most METRIC_CROP square, snapped to the 8px grid so the
     blockiness metric still sees the DCT block boundaries."""
@@ -465,10 +572,16 @@ class Result:
     b: int | None = None
     b_ratio: float = 0.0
     b_unreliable: bool = False
+    b_period: float = 0.0
     d: int | None = None
     d_ratio: float = 0.0
     composite: int = 10
     no_metrics: bool = False
+    scored: bool = False          # two-pass: has the rendered score been taken?
+    # The bucket the score was measured at. Kept separate from `bucket` because
+    # merging may move the image afterwards, and the cache key must describe
+    # what was actually rendered, not where it ended up.
+    scored_bucket: tuple[int, int] | None = None
 
     out_stem: str = ""
     out_name: str = ""
@@ -491,9 +604,9 @@ class Result:
 def place(res: Result, tier: int, bucket: tuple[int, int]) -> None:
     """Pin a result to a bucket and recompute every derived geometry field.
 
-    Every assignment goes through here - the initial one in analyse(), the
-    override replay, and --optimize's moves - so a relocated image gets exactly
-    the same crop box it would have got had it been assigned there first time.
+    Every assignment goes through here - the initial one in analyse() and the
+    merge pass's moves - so a relocated image gets exactly the same crop box it
+    would have got had it been assigned there first time.
     """
     bw, bh = bucket
     res.tier = tier
@@ -506,28 +619,88 @@ def place(res: Result, tier: int, bucket: tuple[int, int]) -> None:
     res.r_factor = math.sqrt((cw * ch) / (bw * bh))
 
 
+def _assign(res: Result) -> bool:
+    """Family and tier from dimensions alone. False if it fits no tier."""
+    if res.src_w < 1 or res.src_h < 1:
+        raise ValueError("zero-sized image")
+    res.src_ar = res.src_w / res.src_h
+    res.family = assign_family(res.src_ar)              # 5.2
+    fit = assign_tier(res.src_w, res.src_h, res.family)  # 5.3
+    if fit is None:
+        bw, bh = bucket_for(TIERS[-1], res.family)
+        res.crop = crop_dims(res.src_w, res.src_h, bw / bh)
+        res.need = needed_area(TIERS[-1], res.family)
+        res.status = ST_SMALL
+        return False
+    place(res, fit[0], fit[1])
+    return True
+
+
+def analyse_geometry(path: Path) -> Result:
+    """Phase A for two-pass mode: header reads only, no pixels touched."""
+    res = Result(path=path, name=path.name)
+    try:
+        res.src_w, res.src_h, _fmt, _qt = read_geometry(path)
+        _assign(res)
+    except Exception as exc:
+        res.status = ST_ERROR
+        res.error = f"{type(exc).__name__}: {exc}"
+    return res
+
+
+def score_rendered(res: Result, resample: int) -> None:
+    """Score the image as it will actually reach the trainer.
+
+    Everything here is measured on the rendered pixels, at the bucket the image
+    is destined for. Q is still estimated from the source's quantization tables
+    because that information exists nowhere else, but it is reported only and
+    deliberately kept out of the composite: it describes the source encode, and
+    after a 4x downscale that encode's faults are no longer present in the file
+    being written. Letting it into a min() composite is precisely what made
+    good high-resolution material score 1.
+    """
+    img, fmt, qtables = load_source(res.path)
+    try:
+        out = img.resize(res.bucket, resample=resample, box=res.box)
+    finally:
+        img.close()
+    luma = out.convert("L")
+    out.close()
+    res.scored_bucket = res.bucket
+
+    res.d_ratio = detail_ratio(luma)
+    res.d = score_d_rendered(res.d_ratio)
+
+    if qtables:
+        res.q_est = estimate_jpeg_quality(qtables[min(qtables)])
+        res.q = score_q(res.q_est)                      # reported, not scored
+        # An 8px source block occupies 8 * scale pixels in the output.
+        res.b_period = 8.0 * (res.bucket[0] / res.crop[0])
+        energy = block_period_energy(luma, res.b_period)
+        if energy is not None:
+            res.b_ratio = energy
+            res.b = score_b_rendered(energy)
+    elif fmt in ("PNG", "BMP"):
+        res.q_est, res.q = None, 10                     # lossless source
+
+    # B only exists where a JPEG block grid survived the resize; where it did
+    # not, that is the answer, and detail carries the score alone.
+    scores = [s for s in (res.b, res.d) if s is not None]
+    res.composite = min(scores) if scores else 10
+    res.no_metrics = not scores
+    res.scored = True
+
+
 def analyse(path: Path) -> Result:
-    """Phase A: everything that can be decided without writing anything."""
+    """Phase A for --single-pass: decode and score the source up front."""
     res = Result(path=path, name=path.name)
     try:
         img, fmt, qtables = load_source(path)
 
         res.src_w, res.src_h = img.size
-        if res.src_w < 1 or res.src_h < 1:
-            raise ValueError("zero-sized image")
-        res.src_ar = res.src_w / res.src_h
-
-        # 5.2 family, 5.3 tier
-        res.family = assign_family(res.src_ar)
-        fit = assign_tier(res.src_w, res.src_h, res.family)
-        if fit is None:
-            bw, bh = bucket_for(TIERS[-1], res.family)
-            res.crop = crop_dims(res.src_w, res.src_h, bw / bh)
-            res.need = needed_area(TIERS[-1], res.family)
-            res.status = ST_SMALL
+        if not _assign(res):
+            img.close()
             return res
-
-        place(res, fit[0], fit[1])
 
         # 6  metrics, on the source after transpose and RGB conversion
         if fmt in ("PNG", "BMP"):
@@ -554,12 +727,98 @@ def analyse(path: Path) -> Result:
         else:
             res.composite = 10
             res.no_metrics = True
+        res.scored = True
 
         img.close()
     except Exception as exc:  # one image raising must not kill the run
         res.status = ST_ERROR
         res.error = f"{type(exc).__name__}: {exc}"
     return res
+
+
+# ---------------------------------------------------------------------------
+# Score cache
+# ---------------------------------------------------------------------------
+#
+# Rendered scores cost a decode and a resize each, and they do not depend on
+# --threshold at all. The intended workflow is to re-run at a different
+# threshold, so without a cache every tuning pass would re-render the whole
+# folder to arrive at numbers it already had. Keyed on size and mtime, so an
+# edited source is rescored; --force ignores it entirely.
+
+CACHE_FILENAME = "scores.json"
+CACHE_VERSION = 2
+
+
+def load_score_cache(prep_dir: Path) -> dict:
+    path = prep_dir / CACHE_FILENAME
+    if not path.is_file():
+        return {}
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if doc.get("version") != CACHE_VERSION:
+            return {}
+        return doc.get("scores", {})
+    except Exception:
+        return {}                                 # unreadable cache is not fatal
+
+
+def cache_key(res: Result) -> tuple[int, int, int, int]:
+    st = res.path.stat()
+    bucket = res.scored_bucket or res.bucket
+    return (st.st_size, st.st_mtime_ns, bucket[0], bucket[1])
+
+
+def apply_cached_score(res: Result, cache: dict) -> bool:
+    entry = cache.get(res.name)
+    if not entry:
+        return False
+    res.scored_bucket = res.bucket
+    try:
+        if list(cache_key(res)) != entry["key"]:
+            res.scored_bucket = None
+            return False
+    except OSError:
+        res.scored_bucket = None
+        return False
+    res.q_est = entry["q_est"]
+    res.q = entry["q"]
+    res.b = entry["b"]
+    res.b_ratio = entry["b_ratio"]
+    res.b_period = entry["b_period"]
+    res.d = entry["d"]
+    res.d_ratio = entry["d_ratio"]
+    res.composite = entry["composite"]
+    res.no_metrics = entry["no_metrics"]
+    res.scored = True
+    return True
+
+
+def save_score_cache(prep_dir: Path, results: list[Result], stamp: datetime) -> None:
+    scores = {}
+    for res in results:
+        if not res.scored or res.scored_bucket is None:
+            continue
+        try:
+            key = list(cache_key(res))
+        except OSError:
+            continue
+        scores[res.name] = {
+            "key": key, "q_est": res.q_est, "q": res.q,
+            "b": res.b, "b_ratio": res.b_ratio, "b_period": res.b_period,
+            "d": res.d, "d_ratio": res.d_ratio,
+            "composite": res.composite, "no_metrics": res.no_metrics,
+        }
+    doc = {
+        "note": "k2prep rendered-image scores, cached so that re-running at a "
+                "different --threshold does not re-render the folder. Safe to "
+                "delete; it will be rebuilt.",
+        "version": CACHE_VERSION,
+        "updated": f"{stamp:%Y-%m-%d %H:%M:%S}",
+        "scores": scores,
+    }
+    (prep_dir / CACHE_FILENAME).write_text(
+        json.dumps(doc, indent=1) + "\n", encoding="utf-8")
 
 
 # ---------------------------------------------------------------------------
@@ -982,7 +1241,11 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     out: list[str] = []
     w = out.append
 
-    processed = [r for r in results if r.status in (ST_ACCEPTED, ST_ALREADY)]
+    # In the preliminary report nothing has been accepted yet - the threshold has
+    # not been applied - so the table describes every image that fits a tier.
+    keep = ((ST_CANDIDATE, ST_ACCEPTED, ST_ALREADY) if stage == STAGE_PRELIMINARY
+            else (ST_ACCEPTED, ST_ALREADY))
+    processed = [r for r in results if r.status in keep]
     already = [r for r in results if r.status == ST_ALREADY]
     below = [r for r in results if r.status == ST_BELOW]
     small = [r for r in results if r.status == ST_SMALL]
@@ -1022,10 +1285,25 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
         w(f"              as the move crops no more than {MERGE_MAX_CROP:.0f}% "
           f"of the source.")
     w("policy      : rejected images are skipped, not copied. Source folder unmodified.")
-    w("metric note : B is computed on the 8px grid and is unreliable for images")
-    w("              rescaled after JPEG encoding; such scores are marked with ?")
-    w(f"              B and D are computed on a centre crop of at most "
-      f"{METRIC_CROP}x{METRIC_CROP}.")
+    if args.single_pass:
+        w("scoring     : --single-pass, on the SOURCE image, before rendering.")
+        w("metric note : B is computed on the 8px grid and is unreliable for images")
+        w("              rescaled after JPEG encoding; such scores are marked with ?")
+        w(f"              B and D are computed on a centre crop of at most "
+          f"{METRIC_CROP}x{METRIC_CROP}.")
+    else:
+        w("scoring     : on the RENDERED image, at the bucket it was assigned, so")
+        w("              the score describes the pixels the trainer actually sees.")
+        w("metric note : B measures the source's 8x8 block grid where it survived")
+        w("              the resize. It reads n/a once the downscale puts that grid")
+        w(f"              past {MIN_BLOCK_PERIOD:.0f} output pixels per block, which "
+          "is not a gap in the")
+        w("              measurement - the artifacts are genuinely gone. D then")
+        w("              carries the score alone.")
+        w("              Q is estimated from the source's quantization tables and is")
+        w("              REPORTED ONLY. It describes the source encode, which a")
+        w("              downscale has already discarded; scoring it is what made")
+        w("              good high-resolution material fail a threshold.")
     if stage == STAGE_FINAL and moves:
         w("legend      : * marks an image the merge pass moved out of its natural")
         w("              bucket; its family column shows where it ended up.")
@@ -1046,18 +1324,30 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     w("")
 
     # -- processed -----------------------------------------------------------
-    w(f"PROCESSED  ({_fmt_int(len(processed))} images)")
+    have_scores = any(r.scored for r in tiered)
+    if stage == STAGE_PRELIMINARY:
+        w(f"FITS A TIER  ({_fmt_int(len(processed))} images)")
+    else:
+        w(f"PROCESSED  ({_fmt_int(len(processed))} images)")
     w("-" * 66)
+    q_head = "Q" if args.single_pass else "Q~"
     w(f"{'filename':<{name_w}}{'source':<12}{'AR':<7}{'family':<8}{'tier':<6}"
-      f"{'bucket':<12}{'crop%':>6}  {'R':<6}{'Q':>3} {'B':>3} {'D':>3} {'score':>6}")
+      f"{'bucket':<12}{'crop%':>6}  {'R':<6}{q_head:>3} {'B':>3} {'D':>3} {'score':>6}")
     for r in processed:
         src = f"{r.src_w}x{r.src_h}"
         bucket = f"{r.bucket[0]}x{r.bucket[1]}"
         family = r.bucket_family + ("*" if r.merged else "")
+        scores = (f"{_score_cell(r.q):>3} {_score_cell(r.b, r.b_unreliable):>3} "
+                  f"{_score_cell(r.d):>3} {r.composite:>6}"
+                  if r.scored else f"{'-':>3} {'-':>3} {'-':>3} {'-':>6}")
         w(f"{r.name:<{name_w}}{src:<12}{r.src_ar:<7.3f}{family:<8}{r.tier:<6}"
-          f"{bucket:<12}{r.crop_pct:>5.1f}%  {r.r_factor:<6.2f}"
-          f"{_score_cell(r.q):>3} {_score_cell(r.b, r.b_unreliable):>3} "
-          f"{_score_cell(r.d):>3} {r.composite:>6}")
+          f"{bucket:<12}{r.crop_pct:>5.1f}%  {r.r_factor:<6.2f}{scores}")
+    if not args.single_pass:
+        w("")
+        w("Q~ is informational and excluded from the score; see the metric note.")
+        if stage == STAGE_PRELIMINARY:
+            w("Scores are blank here: nothing has been rendered yet, and this mode")
+            w("scores the rendered image. They appear in the final report.")
     w("")
 
     # -- merge ---------------------------------------------------------------
@@ -1101,6 +1391,9 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     # -- below threshold -----------------------------------------------------
     w(f"SKIPPED - below threshold {args.threshold}  ({_fmt_int(len(below))} images)")
     w("-" * 66)
+    if stage == STAGE_PRELIMINARY and not have_scores:
+        w("Not applied yet: this mode scores the rendered image, so nothing can")
+        w("be rejected until it has been rendered. See the final report.")
     if below:
         w(f"{'filename':<{name_w}}{'source':<12}{'score':>6}  failed")
         for r in below:
@@ -1234,17 +1527,19 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
         w("  (none)")
     w("")
 
-    w("QUALITY DISTRIBUTION (composite, all images that fit a tier)")
-    hist = defaultdict(int)
-    for r in tiered:
-        hist[r.composite] += 1
-    peak = max(hist.values()) if hist else 0
-    for score in range(10, 0, -1):
-        n = hist[score]
-        bar = "#" * (round(40 * n / peak) if peak else 0)
-        pct = 100.0 * n / max(len(tiered), 1)
-        w(f"  {score:>2}  {bar:<40}  {_fmt_int(n):>8}  {pct:>5.1f}%")
-    w("")
+    if have_scores:
+        scored = [r for r in tiered if r.scored]
+        w("QUALITY DISTRIBUTION (composite, all images that fit a tier)")
+        hist = defaultdict(int)
+        for r in scored:
+            hist[r.composite] += 1
+        peak = max(hist.values()) if hist else 0
+        for score in range(10, 0, -1):
+            n = hist[score]
+            bar = "#" * (round(40 * n / peak) if peak else 0)
+            pct = 100.0 * n / max(len(scored), 1)
+            w(f"  {score:>2}  {bar:<40}  {_fmt_int(n):>8}  {pct:>5.1f}%")
+        w("")
 
     w("CROP COST")
     crops = [r.crop_pct for r in processed]
@@ -1383,6 +1678,12 @@ def parse_args(argv=None):
                    help="Worker threads, 1..32. Default 4.")
     p.add_argument("--force", action="store_true",
                    help="Overwrite existing outputs instead of skipping.")
+    p.add_argument("--single-pass", action="store_true", dest="single_pass",
+                   help="Score the source image and reject before rendering, "
+                        "instead of scoring the rendered result. Faster, but "
+                        "quality is resolution-dependent: a large source that "
+                        "cleans up beautifully at 1024 is judged on pixels the "
+                        "trainer never sees.")
     p.add_argument("--no-merge", action="store_true", dest="no_merge",
                    help=f"Do not consolidate buckets holding fewer than "
                         f"{MIN_BUCKET_SIZE} images. Every image stays in the "
@@ -1421,42 +1722,71 @@ def main(argv=None) -> int:
     ext = ".png" if args.png else ".jpg"
     resample = RESAMPLE_FILTERS[args.filter]
 
-    # -- phase A: parallel analysis -----------------------------------------
+    # -- phase A: geometry (and, in single-pass mode, source scores) ---------
+    # Two-pass mode reads headers only here: nothing is decoded until there is
+    # a bucket to render into.
+    worker = analyse if args.single_pass else analyse_geometry
     results: list[Result] = []
     if images:
         with ThreadPoolExecutor(max_workers=args.threads) as pool:
-            futures = [pool.submit(analyse, p) for p in images]
+            futures = [pool.submit(worker, p) for p in images]
             for fut in tqdm(as_completed(futures), total=len(futures),
-                            desc="analysing", unit="img"):
+                            desc="analysing" if args.single_pass else "scanning ",
+                            unit="img"):
                 results.append(fut.result())
     # Report ordering is by filename, not completion order.
     results.sort(key=lambda r: r.name)
-
-    # -- phase B: main thread, sequential and deterministic ------------------
     for r in results:
         if r.status == ST_CANDIDATE:
             r.caption_src = caption_for(r.path)
-            if r.composite < args.threshold:
-                r.status = ST_BELOW
-            else:
-                r.status = ST_ACCEPTED
-
-    accepted = [r for r in results if r.status == ST_ACCEPTED]
 
     # -- preliminary report: the natural, unmerged assignment ----------------
-    # Written before anything is decided about merging, so the bucket
-    # distribution it shows is the raw one - the problem the merge pass exists
-    # to fix. Diff it against the final report to see exactly what moved.
+    # Written before merging is decided and, in two-pass mode, before anything
+    # is scored - so the bucket distribution it shows is the raw one, the
+    # problem the merge pass exists to fix. Diff it against the final report to
+    # see exactly what moved and what the rendered scores turned out to be.
     reports_dir.mkdir(parents=True, exist_ok=True)
     kind = "scan" if args.report else "process"
     stamp = f"{started:%Y%m%d-%H%M%S}"
-    resolve_names(accepted, ext)
+    candidates = [r for r in results if r.status == ST_CANDIDATE]
+    resolve_names(candidates, ext)
     prelim_path = _free_path(reports_dir, f"{kind}-{stamp}-preliminary", ".txt")
     prelim_path.write_text(
         build_report(args, folder, results, unknown, [], started, datetime.now(),
                      time.perf_counter() - t0, [], STAGE_PRELIMINARY),
         encoding="utf-8",
     )
+
+    # -- phase S: render every candidate and score the result -----------------
+    # The whole point of the default mode. Nothing is saved here; the rendered
+    # image exists only long enough to be measured, so images that fail the
+    # threshold are never written to disk at all.
+    cache_hits = 0
+    if not args.single_pass and candidates:
+        cache = {} if args.force else load_score_cache(prep_dir)
+        todo = []
+        for r in candidates:
+            if apply_cached_score(r, cache):
+                cache_hits += 1
+            else:
+                todo.append(r)
+        if todo:
+            with ThreadPoolExecutor(max_workers=args.threads) as pool:
+                futures = {pool.submit(score_rendered, r, resample): r for r in todo}
+                for fut in tqdm(as_completed(futures), total=len(futures),
+                                desc="scoring  ", unit="img"):
+                    r = futures[fut]
+                    try:
+                        fut.result()
+                    except Exception as exc:
+                        r.status = ST_ERROR
+                        r.error = f"{type(exc).__name__}: {exc}"
+
+    # -- threshold, on whichever score was taken -----------------------------
+    for r in results:
+        if r.status == ST_CANDIDATE:
+            r.status = ST_BELOW if r.composite < args.threshold else ST_ACCEPTED
+    accepted = [r for r in results if r.status == ST_ACCEPTED]
 
     # -- merge: consolidate undersized buckets before writing anything -------
     moves: list[Move] = []
@@ -1466,7 +1796,7 @@ def main(argv=None) -> int:
 
     # Names are resolved after merging, because collisions are per tier folder
     # and merging can move an image into a different tier.
-    for r in accepted:
+    for r in results:
         r.out_stem = ""
         r.out_name = ""
         r.collided = False
@@ -1508,8 +1838,17 @@ def main(argv=None) -> int:
     elapsed = time.perf_counter() - t0
     finished = datetime.now()
 
-    # -- toml, written every run ---------------------------------------------
     notes: list[str] = []
+    if not args.single_pass and candidates:
+        # Written in dry runs too: it costs nothing and makes the recommended
+        # "--report first, then run for real" workflow skip a second rendering
+        # pass over the whole folder.
+        save_score_cache(prep_dir, results, finished)
+        notes.append(f"rendered scores cached in {CACHE_FILENAME} "
+                     f"({cache_hits} of {len(candidates)} reused this run). "
+                     "Delete it to force a rescore.")
+
+    # -- toml, written every run ---------------------------------------------
     toml_path = None
     if args.report:
         notes.append(f"{TOML_FILENAME} not written: a dry run creates no tier "

@@ -141,6 +141,62 @@ def test_needed_area_matches_spec_table():
 
 
 # ---------------------------------------------------------------------------
+# Rendered-image scoring
+# ---------------------------------------------------------------------------
+
+def _block_grid(w, h, period, amplitude=12.0, base=110.0):
+    """A synthetic image with a vertical edge every `period` pixels, which is
+    what a JPEG block grid looks like to the metric."""
+    import numpy as np
+    from PIL import Image
+    x = np.arange(w)
+    step = np.floor(x / period) * amplitude
+    step = step - step.mean()
+    field = np.tile(base + step, (h, 1))
+    return Image.fromarray(np.clip(field, 0, 255).astype("uint8"), "L")
+
+
+def test_block_detector_finds_a_known_period():
+    """The detector must lock on to a non-integer period, since an 8px source
+    block lands every 8*scale output pixels."""
+    for period in (4.0, 5.7, 8.0, 11.3):
+        img = _block_grid(600, 64, period)
+        strong = k.block_period_energy(img, period)
+        assert strong is not None and strong > 0.10, (period, strong)
+        # ... and must not fire on a period the image does not contain
+        wrong = k.block_period_energy(img, period * 1.7)
+        assert wrong < strong / 2, (period, wrong, strong)
+
+
+def test_block_detector_reports_nothing_below_the_resolution_limit():
+    """A heavy downscale puts the grid past Nyquist. Returning None there is the
+    correct answer, not a gap: the artifacts really are gone."""
+    img = _block_grid(600, 64, 8.0)
+    assert k.block_period_energy(img, 2.0) is None
+    assert k.block_period_energy(img, k.MIN_BLOCK_PERIOD - 0.1) is None
+    assert k.block_period_energy(img, k.MIN_BLOCK_PERIOD) is not None
+
+
+def test_flat_image_scores_clean():
+    import numpy as np
+    from PIL import Image
+    noise = (np.random.default_rng(0).normal(128, 20, (400, 400))
+             .clip(0, 255).astype("uint8"))
+    img = Image.fromarray(noise, "L")
+    assert k.block_period_energy(img, 8.0) < 0.05
+
+
+def test_rendered_bands_are_separate_from_source_bands():
+    """They measure different pixels and must not be silently interchangeable."""
+    assert k.D_RENDERED_BANDS != k.D_BANDS
+    assert k.score_d_rendered(0.140) == 10 and k.score_d_rendered(0.005) == 1
+    assert k.score_b_rendered(0.005) == 10 and k.score_b_rendered(0.5) == 1
+    # monotone, and every band reachable
+    assert [k.score_d_rendered(lo) for lo, _s in k.D_RENDERED_BANDS] == list(range(10, 1, -1))
+    assert [k.score_b_rendered(hi) for hi, _s in k.B_RENDERED_BANDS] == list(range(10, 1, -1))
+
+
+# ---------------------------------------------------------------------------
 # Bucket merging
 # ---------------------------------------------------------------------------
 

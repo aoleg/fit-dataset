@@ -30,9 +30,10 @@ and when the report looks right:
 run.bat "L:\train\photos" --threshold 6
 ```
 
-That is the whole workflow. One run scans, scores, assigns buckets, consolidates
-the undersized ones, writes the images and captions, and emits
-`_prep/dataset.toml` ready to hand to musubi-tuner.
+That is the whole workflow. One run scans, assigns buckets, consolidates the
+undersized ones, renders and scores every image, writes the ones that pass along
+with their captions, and emits `_prep/dataset.toml` ready to hand to
+musubi-tuner.
 
 **Run `--report` first.** It is a dry run: it analyses everything and writes a
 report but no images. Because rejections leave no artifact on disk — nothing is
@@ -57,8 +58,9 @@ k2prep.py <folder> [options]
 | `--png` | off | Write PNG instead of JPEG q97 4:4:4. |
 | `--filter NAME` | `lanczos` | `lanczos`, `box`, `bicubic`, `bilinear`. |
 | `--threads N` | 4 | Worker threads. Range 1–32. |
-| `--force` | off | Overwrite existing outputs instead of skipping. |
+| `--force` | off | Overwrite existing outputs instead of skipping, and ignore the score cache. |
 | `--no-merge` | off | Skip bucket consolidation; leave every image in the bucket its own aspect ratio picks. |
+| `--single-pass` | off | Score the source and reject before rendering, instead of scoring the rendered result. |
 
 `--report` and `--threshold` compose: `--report --threshold 7` shows what a
 threshold-7 run *would* do without writing anything.
@@ -71,9 +73,10 @@ sidecars copied alongside, plus `_prep/dataset.toml`. Every run writes two
 timestamped reports to `<folder>/_prep/reports/`:
 
 - `*-preliminary.txt` — the natural, per-family bucket assignment, before any
-  consolidation. This is the bucket explosion in its raw form.
-- `*-final.txt` — what was actually written, including what the merge pass moved
-  and what it could not.
+  consolidation and before anything is scored. This is the bucket explosion in
+  its raw form.
+- `*-final.txt` — what was actually written, with the rendered scores, what the
+  merge pass moved, and what it could not.
 
 Reports are never overwritten, so two threshold settings are diffable — and so
 are the two stages of a single run.
@@ -182,28 +185,70 @@ If the final report still shows a long list of populated buckets in one tier,
 check the preliminary report first — if the two are identical, merging found
 nothing it was allowed to move, and the reasons are in `STILL UNDERSIZED`.
 
-## The D metric is uncalibrated
+## Quality is scored on the rendered image, not the source
 
-Four sub-metrics are scored 1–10 on fixed absolute scales, and the composite is
-their **minimum**, not their mean — a quality fault is disqualifying, so
-`--threshold 6` means "every available metric is at least 6".
+Quality is resolution-dependent, so measuring the source tells you about pixels
+the trainer never sees. Take one photograph, save it twice at JPEG q30 — once at
+5056×3792, once at 1300×975 — and both land in the same 1136×912 bucket. They are
+not the same training image:
 
-- **Q** — estimated JPEG quality from the quantization tables. Lossless inputs
-  score 10; encoders using non-standard tables (Adobe, several phone makers)
-  report `n/a` and are excluded rather than guessed at.
-- **B** — 8×8 DCT block edge strength. Unreliable for images rescaled after JPEG
-  encoding, since the grid no longer aligns; those scores are marked `?`.
-- **D** — detail, as high-frequency energy normalised by contrast.
-- **R** — resolution headroom against the *assigned tier's* bucket, reported as a
-  raw factor rather than scored.
+| | source-scored (`--single-pass`) | rendered-scored (default) |
+|---|---|---|
+| 5056×3792 @ q30 | 1 | **10** |
+| 1300×975 @ q30 | 1 | **2** |
 
-**The D bands are a starting point and are explicitly uncalibrated.** They produce
-genuine false positives on bokeh, fog, snow, and deliberately minimal
-compositions. Run `--report` on your actual folder, read the QUALITY
-DISTRIBUTION histogram — it covers every image that reached a tier, including
-those below the threshold, so you can see what a different threshold would
-recover — and adjust `D_BANDS` at the top of `k2prep.py` before trusting
-`--threshold` to act on D.
+The large one is downscaled 4×, which averages the 8×8 block edges away
+completely; what reaches the VAE is clean. The small one arrives at roughly 1:1
+and keeps every artifact it ever had. Scoring the source cannot tell them apart,
+and rejects the good one.
+
+So by default k2prep renders every image that fits a tier, scores that, and only
+then writes the ones that pass. Rejected images are never written — the rendered
+copy exists in memory only long enough to be measured.
+
+- **D** — detail, as high-frequency energy normalised by contrast, on the
+  rendered image. This carries most of the scoring.
+- **B** — strength of the source's 8×8 block grid *where it survived the resize*.
+  An 8px source block lands every `8 × scale` output pixels, so the metric looks
+  for periodicity at that (usually fractional) period. Below 3 output pixels per
+  block it reports `n/a` — not a gap in the measurement, the artifacts are
+  genuinely gone. Only JPEG sources have a grid to look for.
+- **Q~** — estimated JPEG quality from the source's quantization tables.
+  **Reported only, deliberately excluded from the score.** It describes the
+  source encode, which a downscale has already discarded. Letting it into a
+  `min()` composite is exactly what made good high-resolution material score 1.
+- **R** — resolution headroom against the assigned tier's bucket, a raw factor
+  rather than a score.
+
+The composite is the **minimum** of the metrics that apply, so `--threshold 6`
+means "every available metric is at least 6".
+
+`--single-pass` restores the old behaviour: Q, B and D measured on the source,
+and the threshold applied before anything is rendered. It is faster and it is
+what you want if you already know your sources are uniform in resolution.
+
+### Cost, and the score cache
+
+The default mode renders each image twice on a first run — once to score, once
+to write. Scores do not depend on `--threshold`, so they are cached in
+`_prep/scores.json`, keyed on file size and mtime. Re-running at a different
+threshold reuses every score and rewrites only what changed, which makes the
+tune-and-re-run loop essentially free. Delete the file to force a rescore;
+`--force` ignores it.
+
+### The bands are uncalibrated
+
+**Both band tables are a starting point and are explicitly uncalibrated.** They
+were fitted against a 29-image reference folder and a controlled quality sweep,
+which is better than nothing and a long way from calibrated. D in particular
+produces genuine false positives on bokeh, fog, snow, and deliberately minimal
+compositions.
+
+Run `--report` on your actual folder and read the QUALITY DISTRIBUTION histogram
+in the final report — it covers every image that reached a tier, including those
+below the threshold, so you can see what a different threshold would recover.
+Then adjust `D_RENDERED_BANDS` and `B_RENDERED_BANDS` at the top of `k2prep.py`
+before trusting `--threshold` to act on them.
 
 ## Tests
 
@@ -212,7 +257,7 @@ python test_k2prep.py
 ```
 
 Covers the bucket generation port, the per-tier family table, the geometry half
-of the acceptance criteria, and the merge rules.
+of the acceptance criteria, the merge rules, and the rendered-image metrics.
 
 ## License
 
