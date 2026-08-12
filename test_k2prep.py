@@ -197,6 +197,70 @@ def test_rendered_bands_are_separate_from_source_bands():
 
 
 # ---------------------------------------------------------------------------
+# --sort
+# ---------------------------------------------------------------------------
+
+def _sorted_geometry(w, h):
+    """What analyse_for_sort would decide, without touching a file."""
+    from pathlib import Path
+    res = k.Result(path=Path("x.jpg"), name="x.jpg")
+    res.src_w, res.src_h = w, h
+    res.src_ar = w / h
+    res.family = k.assign_family(res.src_ar)
+    target = k.bucket_for(k.SORT_TIER, res.family)
+    cw, ch = k.crop_dims(w, h, target[0] / target[1])
+    res.crop = (cw, ch)
+    res.bucket = target if cw * ch > target[0] * target[1] else (cw, ch)
+    return res, target
+
+
+def test_sort_always_judges_at_the_1024_tier():
+    """A small image would be a 512-tier image in the dataset pipeline, but its
+    sort score must still be measured against 1024 or scores from different
+    folders cannot be compared."""
+    for w, h in ((6000, 4000), (2400, 600), (640, 480), (400, 300)):
+        res, target = _sorted_geometry(w, h)
+        assert target == k.bucket_for(1024, res.family)
+
+
+def test_sort_downscales_large_sources():
+    res, target = _sorted_geometry(6000, 4000)
+    assert res.bucket == target                     # rendered down to 1024
+    assert res.bucket != res.crop
+
+
+def test_sort_never_upscales_a_small_source():
+    """'Already at 1024 or less' is scored as it is; upscaling would invent
+    detail and flatter the result."""
+    for w, h in ((800, 600), (400, 300), (640, 480)):
+        res, target = _sorted_geometry(w, h)
+        assert res.bucket == res.crop, (w, h)
+        assert res.bucket[0] <= target[0] and res.bucket[1] <= target[1]
+        # scored at scale 1.0, so the block period is the source's own 8px grid
+        assert 8.0 * (res.bucket[0] / res.crop[0]) == 8.0
+
+
+def test_sort_score_maps_to_its_folder():
+    from pathlib import Path
+    prep = Path("/tmp/_prep")
+    for score in range(1, 11):
+        assert k.sort_dir_for(prep, score).name == f"{k.SORT_DIR_PREFIX}{score}"
+
+
+def test_move_requires_sort():
+    import contextlib, io
+    for argv in (["f", "--move"], ["f", "--move", "--threshold", "5"]):
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                k.parse_args(argv)
+            except SystemExit as exc:
+                assert exc.code != 0
+            else:
+                raise AssertionError("--move was accepted without --sort")
+    assert k.parse_args(["f", "--sort", "--move"]).move is True
+
+
+# ---------------------------------------------------------------------------
 # Bucket merging
 # ---------------------------------------------------------------------------
 

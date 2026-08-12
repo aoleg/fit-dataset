@@ -10,7 +10,11 @@ scatters across, the trainer typically sees two or three per tier.
 The output is a **filtered subset**, not a transformation of the whole folder.
 Images that fail the quality threshold or are too small are skipped entirely, and
 the source folder is never written to, moved within, or deleted from — the report
-is the only record of a rejection.
+is the only record of a rejection. (The single exception is `--sort --move`,
+which exists to move originals and says so.)
+
+It can also just [sort a folder by quality](#sorting-a-folder-by-quality) and
+build nothing.
 
 ## Install and run
 
@@ -61,6 +65,8 @@ k2prep.py <folder> [options]
 | `--force` | off | Overwrite existing outputs instead of skipping, and ignore the score cache. |
 | `--no-merge` | off | Skip bucket consolidation; leave every image in the bucket its own aspect ratio picks. |
 | `--single-pass` | off | Score the source and reject before rendering, instead of scoring the rendered result. |
+| `--sort` | off | Triage mode: score every image and file the **original** under `_prep/score1` … `_prep/score10`. Builds no dataset. |
+| `--move` | off | With `--sort` only: move the originals instead of copying them. |
 
 `--report` and `--threshold` compose: `--report --threshold 7` shows what a
 threshold-7 run *would* do without writing anything.
@@ -86,6 +92,60 @@ exactly: outputs left by an earlier run that the current one does not place
 (because the threshold changed, or merging moved an image elsewhere) are removed
 and listed under `SUPERSEDED OUTPUTS` in the final report. The source folder is
 never touched, so anything removed is one re-run away from coming back.
+
+## Sorting a folder by quality
+
+`--sort` is a different job from building a dataset. It scores every image and
+files the **original** — untouched, full size, with its `.txt` sidecar — under
+the folder for its score:
+
+```bash
+run.bat "L:\train\photos" --sort
+```
+
+```
+_prep/score10/   IMG_0431.jpg  IMG_0431.txt  ...
+_prep/score9/    ...
+_prep/score2/    ...
+```
+
+It writes no tier folders, no resized images and no TOML. The point is triage:
+see what you have, keep the good folders, then run k2prep normally on whichever
+of them you decide to train from.
+
+**Every image is scored at the 1024 tier**, whatever tier the dataset pipeline
+would have put it in. "How good would this be as a training image" has one
+answer, and asking it at three different resolutions would make the scores
+incomparable between folders — which is the opposite of what sorting is for.
+Tier demotion is a packing decision, not a quality one. An image already at or
+below the 1024 tier is scored as it is, never upscaled first; the report marks
+those with `=`.
+
+`--report` works here too and places nothing.
+
+### `--move`
+
+```bash
+run.bat "L:\train\photos" --sort --move
+```
+
+**This is the only thing in k2prep that removes anything from your source
+folder.** Everywhere else the input folder is strictly read-only, and that has
+not changed — but `--move` is asked for by name and does exactly what it says:
+each image and its caption leave the source folder for their score folder.
+
+What it will not do:
+
+- Move a file it could not read. Anything that fails to decode stays exactly
+  where it is and is named under `ERRORS`.
+- Leave a hole. Each destination is written before its source is unlinked, so an
+  interruption leaves a duplicate to clean up, never a missing file.
+- Delete a stale copy. If an earlier run filed the same image under a different
+  score, that copy is listed under `DUPLICATES IN OTHER SCORE FOLDERS` and left
+  alone — under `--move` it may be the only copy in existence. Clear those by
+  hand.
+
+`--move` without `--sort` is rejected outright.
 
 ## Why the output dimensions look arbitrary
 
@@ -231,7 +291,7 @@ what you want if you already know your sources are uniform in resolution.
 
 The default mode renders each image twice on a first run — once to score, once
 to write. Scores do not depend on `--threshold`, so they are cached in
-`_prep/scores.json`, keyed on file size and mtime. Re-running at a different
+`_prep/metrics-cache.json`, keyed on file size and mtime. Re-running at a different
 threshold reuses every score and rewrites only what changed, which makes the
 tune-and-re-run loop essentially free. Delete the file to force a rescore;
 `--force` ignores it.
