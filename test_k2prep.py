@@ -347,6 +347,115 @@ def test_sort_tier_count_is_validated():
         assert k.parse_args(["f", "--sort", str(good)]).sort == good
 
 
+# ---------------------------------------------------------------------------
+# --vl
+# ---------------------------------------------------------------------------
+
+def test_vl_reply_parsing_survives_how_models_actually_answer():
+    crit = ["sharpness", "composition"]
+    for reply in ('{"sharpness": 7, "composition": 4}',
+                  '```json\n{"sharpness": 7, "composition": 4}\n```',
+                  'Sure! Here you go:\n{"sharpness": 7, "composition": 4}\nHope that helps.',
+                  '{"Sharpness": 7.0, "COMPOSITION": 4}'):
+        assert k.parse_vl_reply(reply, crit) == {"sharpness": 7, "composition": 4}, reply
+    # bare numbers, in order
+    assert k.parse_vl_reply("7 4", crit) == {"sharpness": 7, "composition": 4}
+    # out of range is clamped, not accepted blindly
+    assert k.parse_vl_reply('{"sharpness": 99, "composition": -5}', crit) == \
+        {"sharpness": 10, "composition": 1}
+
+
+def test_vl_reply_parsing_refuses_to_guess():
+    crit = ["sharpness", "composition"]
+    for reply in ("I cannot rate this image.", "", "sharpness is good"):
+        try:
+            k.parse_vl_reply(reply, crit)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"guessed a score from {reply!r}")
+
+
+def test_blend_weights_the_model_higher_without_letting_it_win():
+    both = k.blend_scores(10, 10)
+    great_criteria_broken_image = k.blend_scores(10, 2)
+    great_image_wrong_subject = k.blend_scores(2, 10)
+    mediocre_both = k.blend_scores(7, 7)
+
+    assert abs(both - 10) < 1e-9
+    # the model counts for more...
+    assert great_criteria_broken_image > great_image_wrong_subject
+    # ...but a technically broken image is still marked down, hard enough that
+    # a merely decent one beats it
+    assert great_criteria_broken_image < both
+    assert great_criteria_broken_image < mediocre_both
+    # and it is not overwhelming: a perfect critique cannot rescue a 1
+    assert k.blend_scores(10, 1) < mediocre_both
+
+
+def test_blend_is_monotone_in_both_inputs():
+    for tech in (1, 4, 7, 10):
+        vals = [k.blend_scores(vl, tech) for vl in range(1, 11)]
+        assert all(a < b for a, b in zip(vals, vals[1:])), tech
+    for vl in (1, 4, 7, 10):
+        vals = [k.blend_scores(vl, tech) for tech in range(1, 11)]
+        assert all(a < b for a, b in zip(vals, vals[1:])), vl
+
+
+def test_env_parsing():
+    import tempfile, pathlib
+    with tempfile.TemporaryDirectory() as d:
+        p = pathlib.Path(d) / "x.env"
+        p.write_text('# comment\n\nA=1\n B = "two" \nC=\nD=\'three\'\nnot a pair\n',
+                     encoding="utf-8")
+        assert k.parse_env_file(p) == {"A": "1", "B": "two", "D": "three"}
+
+
+def test_vl_endpoint_normalisation_and_signature():
+    cfg = k.VLConfig("http://localhost:8080/v1", "m", 10.0, ["a", "b"])
+    assert cfg.chat_url.endswith("/v1/chat/completions")
+    assert cfg.models_url.endswith("/v1/models")
+    # the cache identity must move when the question does
+    other = k.VLConfig("http://localhost:8080/v1", "m", 10.0, ["a", "c"])
+    model2 = k.VLConfig("http://localhost:8080/v1", "n", 10.0, ["a", "b"])
+    assert cfg.signature() != other.signature()
+    assert cfg.signature() != model2.signature()
+    # ...but not when something irrelevant does
+    assert cfg.signature() == k.VLConfig("http://elsewhere/v1", "m", 99.0,
+                                         ["a", "b"]).signature()
+
+
+def test_vl_prompt_asks_for_high_is_good_and_names_every_criterion():
+    cfg = k.VLConfig("http://x/v1", "m", 10.0, ["sharpness", "composition"])
+    msgs = k.build_vl_messages(cfg, "AAAA")
+    text = msgs[-1]["content"][0]["text"]
+    assert "10 is excellent, 1 is unusable" in text     # never inverted
+    for c in cfg.criteria:
+        assert f"- {c}" in text
+    assert msgs[-1]["content"][1]["image_url"]["url"].startswith(
+        "data:image/jpeg;base64,")
+
+
+def test_vl_requires_sort():
+    import contextlib, io
+    with contextlib.redirect_stderr(io.StringIO()):
+        try:
+            k.parse_args(["f", "--vl", "sharpness"])
+        except SystemExit as exc:
+            assert exc.code != 0
+        else:
+            raise AssertionError("--vl was accepted without --sort")
+    args = k.parse_args(["f", "--sort", "3", "--vl", " sharpness , Composition ,, sharpness "])
+    assert args.vl_criteria == ["sharpness", "Composition"]   # trimmed, deduped
+
+
+def test_thread_defaults_differ_for_local_work_and_the_model():
+    plain = k.parse_args(["f"])
+    assert (plain.local_threads, plain.vl_threads) == (4, 1)
+    explicit = k.parse_args(["f", "--threads", "8"])
+    assert (explicit.local_threads, explicit.vl_threads) == (8, 8)
+
+
 def test_move_requires_sort():
     import contextlib, io
     for argv in (["f", "--move"], ["f", "--move", "--threshold", "5"]):

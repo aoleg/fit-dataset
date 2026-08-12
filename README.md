@@ -67,6 +67,7 @@ k2prep.py <folder> [options]
 | `--single-pass` | off | Score the source and reject before rendering, instead of scoring the rendered result. |
 | `--sort [N]` | off | Triage mode: score every image and file the **original** by quality. Builds no dataset. Bare `--sort` uses absolute bands (`score1`…`score10`, 10 best); `--sort N` (2–10) cuts N populated tiers from this folder (`quality1` best). |
 | `--move` | off | With `--sort` only: move the originals instead of copying them. |
+| `--vl CRITERIA` | off | With `--sort` only: also have a local vision model rate each image on your own comma-separated criteria, blended with the measured score. |
 
 `--report` and `--threshold` compose: `--report --threshold 7` shows what a
 threshold-7 run *would* do without writing anything.
@@ -171,6 +172,87 @@ below the 1024 tier is scored as it is, never upscaled first; the report marks
 those with `=`.
 
 `--report` works here too and places nothing.
+
+### `--vl`: your own criteria, judged by a local model
+
+B and D measure whether an image is technically sound, and they are the only
+thing here that can. What they cannot do is look at a photograph and say whether
+it is well composed, whether the subject is the thing you wanted, or whether it
+is a screenshot of a menu. A vision-language model can — and is hopeless at the
+reverse, because a vision projector runs at a few hundred pixels, which is
+exactly where compression artifacts and fine detail have already been thrown
+away.
+
+So `--vl` adds the model's opinion alongside the measurements rather than in
+place of them:
+
+```bash
+copy sample.env .env          # then point it at your server
+run.bat "L:\train\photos" --sort 3 --vl "sharpness, composition, lighting"
+```
+
+```
+filename            ...  score    tech    vl   rank  destination
+IMG_20181004.jpg    ...     10   10.63   8.0   8.84  quality1/
+```
+
+`tech` is the measured score, `vl` the model's mean over your criteria, `rank`
+the blend the tiers are cut on. The report also lists every per-criterion score,
+so you can see *why* something ranked where it did.
+
+**How the two combine.** `rank` is a weighted geometric mean — the model at 0.65,
+the measurement at 0.35. Weighted toward the model because it answers the
+question you actually asked; geometric rather than an average because an average
+lets a perfect critique carry a technically broken image, which is the thing this
+blend exists to prevent:
+
+| model | technical | rank |
+|---|---|---|
+| 10 | 10 | 10.0 |
+| 7 | 7 | 7.0 |
+| 10 | 2 | 5.7 |
+| 10 | 1 | 4.5 |
+| 2 | 10 | 3.5 |
+
+A perfect match on your criteria with a broken image lands at 5.7 — clearly
+above a technically perfect image that ignores your criteria (3.5), and clearly
+below a merely decent one (7.0). Tune `VL_WEIGHT` at the top of `k2prep.py` if
+you disagree.
+
+Per-criterion scores are **averaged**, not minimised. The technical composite
+uses `min()` because a compression fault is disqualifying; your criteria describe
+what you are looking for, and a partial match is a real answer rather than a
+failure.
+
+**Local servers only, and no API key is ever sent.** There is no option to add
+one. That is deliberate: no key to leak, no bill to run up, and no folder of
+photographs leaving the machine because a URL was wrong. A hosted endpoint will
+reject the unauthenticated request, which is the intended outcome. Configure it
+in `.env` (copy `sample.env`) — llama.cpp, koboldcpp and LM Studio are what this
+was built against, and the server needs a **vision** model loaded (`--mmproj` for
+llama.cpp).
+
+**A `--vl` run is not reproducible.** A model can answer differently between runs,
+and a different model will disagree outright. The report says so in its header.
+The technical columns beside it are still exact, and the opinions are cached in
+`_prep/vl-cache.json` so re-running the same folder is stable — the cache is
+keyed to the model, the criteria and the prompt, so changing any of them
+correctly throws it away.
+
+`--threads` controls how many requests are in flight, defaulting to **1** for the
+model because llama.cpp, koboldcpp and LM Studio all serve one request at a time
+unless started with parallel slots — and a queue of four in front of a slow model
+is how you turn a working setup into timeouts. Raising it is worth a little
+anyway: against koboldcpp with a 31B vision model, 29 images took 39s at
+`--threads 1` and 32s at `--threads 4`, so expect roughly 20%, not 4×. The same
+flag raises the local worker count to match.
+
+Everything degrades rather than failing: a missing or malformed `.env`, an
+endpoint that is not listening, or one that demands authentication all stop the
+run with one sentence before a single image is opened. A reply the model mangles
+is reported per-image and that image falls back to its technical score, which is
+neither a reward nor a penalty. Five failures in a row abandon the model
+entirely and rank the rest on measurement alone.
 
 ### `--move`
 

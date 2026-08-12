@@ -16,6 +16,9 @@ Single file by design; see SPEC.md section 2.
 from __future__ import annotations
 
 import argparse
+import base64
+import hashlib
+import io
 import json
 import math
 import os
@@ -23,6 +26,8 @@ import shutil
 import statistics
 import sys
 import time
+import urllib.error
+import urllib.request
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
@@ -638,6 +643,24 @@ class Result:
     sort_action: str = ""
     sort_tier: int = 0            # 1 = best, in --sort N mode
     sort_dirname: str = ""
+
+    # --vl
+    vl_scores: dict[str, int] | None = None
+    vl_mean: float | None = None
+    vl_error: str = ""
+
+    @property
+    def rank_fine(self) -> float:
+        """What --sort actually orders on.
+
+        Without --vl this is the technical score. With it, the two are blended -
+        and an image the model could not be scored on falls back to its
+        technical score for both halves, so a missing opinion is neutral rather
+        than silently generous.
+        """
+        if self.vl_mean is None:
+            return self.composite_fine
+        return blend_scores(self.vl_mean, self.composite_fine)
 
     out_stem: str = ""
     out_name: str = ""
@@ -1259,6 +1282,366 @@ MAX_QUALITY_TIERS = 10
 QUALITY_CUT_WINDOW = 0.35
 
 
+# ---------------------------------------------------------------------------
+# --vl: scoring against user criteria with a local vision-language model
+# ---------------------------------------------------------------------------
+#
+# What this is for: the B and D metrics measure whether an image is technically
+# sound, and they are the only thing here that can. What they cannot do is look
+# at a photograph and say whether it is well composed, whether the subject is
+# the thing you wanted, or whether it is a screenshot of a menu. A VL model can,
+# and it is hopeless at the reverse - a vision projector runs at a few hundred
+# pixels, which is exactly where JPEG blocking and fine detail have already been
+# thrown away. The two are complementary, so both are kept and neither is
+# allowed to stand in for the other.
+#
+# LOCAL ENDPOINTS ONLY, and no authentication is ever sent. That is deliberate:
+# no key to leak, no bill to run up, no folder of photographs leaving the
+# machine by accident. A remote endpoint will reject an unauthenticated request
+# on its own, which is the intended outcome.
+#
+# A --vl run is NOT reproducible. Even at temperature 0 a server can return
+# different text between runs, and a different model will disagree entirely.
+# The report says so. Everything else in k2prep remains deterministic, and the
+# technical score is always reported alongside so it can be checked.
+
+VL_ENV_FILENAME = ".env"
+VL_SAMPLE_ENV = "sample.env"
+VL_CACHE_FILENAME = "vl-cache.json"
+VL_PROMPT_VERSION = 1
+
+VL_ENV_ENDPOINT = "K2PREP_VL_ENDPOINT"
+VL_ENV_MODEL = "K2PREP_VL_MODEL"
+VL_ENV_TIMEOUT = "K2PREP_VL_TIMEOUT"
+
+VL_MAX_CRITERIA = 8
+VL_MAX_EDGE = 512          # the projector downsamples anyway; sending more is
+                           # upload for nothing
+VL_JPEG_QUALITY = 85
+VL_RETRIES = 3
+VL_GIVE_UP_AFTER = 5       # consecutive hard failures before abandoning the pass
+
+# How much the model's opinion counts against the measured technical score, as
+# the exponent in a weighted geometric mean. Higher than the technical half,
+# because it answers the question the user actually asked - but a geometric mean
+# means a genuinely broken image cannot be rescued by a perfect critique, which
+# a weighted average would allow. At 0.65: a perfect-criteria, technically awful
+# image (10, 2) lands at 5.7, below a merely good one at (7, 7) = 7.0, while a
+# technically perfect image that ignores the criteria (2, 10) lands at 3.5.
+VL_WEIGHT = 0.65
+
+
+@dataclass
+class VLConfig:
+    endpoint: str
+    model: str
+    timeout: float
+    criteria: list[str]
+
+    @property
+    def chat_url(self) -> str:
+        return f"{self.endpoint}/chat/completions"
+
+    @property
+    def models_url(self) -> str:
+        return f"{self.endpoint}/models"
+
+    def signature(self) -> str:
+        """Cache identity: change the model, the criteria or the prompt and the
+        cached opinions are no longer about the same question."""
+        raw = json.dumps({"v": VL_PROMPT_VERSION, "model": self.model,
+                          "criteria": self.criteria, "edge": VL_MAX_EDGE},
+                         sort_keys=True)
+        return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+
+
+class VLUnavailable(RuntimeError):
+    """The endpoint cannot be used. Raised before any work is done."""
+
+
+def parse_env_file(path: Path) -> dict[str, str]:
+    """Minimal KEY=VALUE reader. No dependencies, no interpolation, no export."""
+    env: dict[str, str] = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        value = value.strip().strip('"').strip("'")
+        if value:
+            env[key.strip()] = value
+    return env
+
+
+def load_vl_config(criteria: list[str]) -> VLConfig:
+    """Read .env from beside the script, then the working directory.
+
+    Every failure here is a clear sentence about what to do next: this runs
+    before any images are touched, so there is no half-finished state to
+    explain.
+    """
+    here = Path(__file__).resolve().parent
+    looked = list(dict.fromkeys([here, Path.cwd().resolve()]))
+    env: dict[str, str] = {}
+    found = None
+    for path in [d / VL_ENV_FILENAME for d in looked]:
+        if path.is_file():
+            try:
+                env = parse_env_file(path)
+            except OSError as exc:
+                raise VLUnavailable(f"cannot read {path}: {exc}") from exc
+            found = path
+            break
+    if found is None:
+        where = " or ".join(str(d) for d in looked)
+        raise VLUnavailable(
+            f"--vl needs a {VL_ENV_FILENAME} naming your local endpoint, and "
+            f"none was found in {where}. Copy {VL_SAMPLE_ENV} to "
+            f"{VL_ENV_FILENAME} and edit it.")
+
+    endpoint = env.get(VL_ENV_ENDPOINT, "").strip().rstrip("/")
+    if not endpoint:
+        raise VLUnavailable(
+            f"{found} does not set {VL_ENV_ENDPOINT}. See {VL_SAMPLE_ENV} for "
+            f"the endpoint each of llama.cpp, koboldcpp and LM Studio uses.")
+    if not endpoint.startswith(("http://", "https://")):
+        raise VLUnavailable(
+            f"{VL_ENV_ENDPOINT} must start with http:// or https://, got "
+            f"{endpoint!r}")
+    if not endpoint.endswith("/v1"):
+        endpoint = f"{endpoint}/v1"
+
+    try:
+        timeout = float(env.get(VL_ENV_TIMEOUT, "120"))
+    except ValueError:
+        raise VLUnavailable(f"{VL_ENV_TIMEOUT} in {found} is not a number")
+
+    return VLConfig(endpoint=endpoint,
+                    model=env.get(VL_ENV_MODEL, "local-model").strip(),
+                    timeout=max(1.0, timeout),
+                    criteria=criteria)
+
+
+def _http_json(url: str, timeout: float, payload: dict | None = None) -> dict:
+    data = json.dumps(payload).encode("utf-8") if payload is not None else None
+    req = urllib.request.Request(
+        url, data=data,
+        headers={"Content-Type": "application/json", "Accept": "application/json"},
+        method="POST" if data else "GET")
+    # No Authorization header, ever. See the note at the top of this section.
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def vl_preflight(cfg: VLConfig) -> str:
+    """One request before the run, so a dead server fails in a sentence rather
+    than as several thousand timeouts."""
+    try:
+        doc = _http_json(cfg.models_url, timeout=min(cfg.timeout, 15.0))
+    except urllib.error.HTTPError as exc:
+        if exc.code in (401, 403):
+            raise VLUnavailable(
+                f"{cfg.endpoint} demands authentication. k2prep deliberately "
+                f"sends no key and supports local servers only.") from exc
+        raise VLUnavailable(f"{cfg.endpoint} answered HTTP {exc.code}") from exc
+    except urllib.error.URLError as exc:
+        raise VLUnavailable(
+            f"cannot reach {cfg.endpoint}: {exc.reason}. Is the server "
+            f"running, and does it have a vision model loaded?") from exc
+    except Exception as exc:
+        raise VLUnavailable(f"cannot reach {cfg.endpoint}: {exc}") from exc
+    names = [m.get("id", "?") for m in doc.get("data", []) if isinstance(m, dict)]
+    return ", ".join(names[:4]) if names else "(server named no model)"
+
+
+def build_vl_messages(cfg: VLConfig, image_b64: str) -> list[dict]:
+    lines = [
+        "Rate this photograph on each criterion below, from 1 to 10.",
+        "10 is excellent, 1 is unusable. Use the whole range.",
+        "",
+        "  10  could not be better on this criterion",
+        "   7  good, with minor faults",
+        "   5  acceptable but clearly flawed",
+        "   3  poor; would hurt a training set",
+        "   1  unusable",
+        "",
+        "Criteria:",
+    ]
+    lines += [f"  - {c}" for c in cfg.criteria]
+    lines += [
+        "",
+        "Reply with one JSON object mapping each criterion to its integer "
+        "score, and nothing else.",
+        "Example: {" + ", ".join(f'"{c}": 7' for c in cfg.criteria) + "}",
+    ]
+    return [
+        {"role": "system",
+         "content": "You grade photographs for a training dataset. "
+                    "You reply with JSON and no commentary."},
+        {"role": "user", "content": [
+            {"type": "text", "text": "\n".join(lines)},
+            {"type": "image_url",
+             "image_url": {"url": f"data:image/jpeg;base64,{image_b64}"}},
+        ]},
+    ]
+
+
+def parse_vl_reply(text: str, criteria: list[str]) -> dict[str, int]:
+    """Pull one score per criterion out of whatever the model actually said.
+
+    Small models fence their JSON, prepend "Sure!", or answer with bare numbers.
+    All three are recoverable; anything else is a failure and is reported as one
+    rather than guessed at.
+    """
+    scores: dict[str, int] = {}
+    start, end = text.find("{"), text.rfind("}")
+    if start != -1 and end > start:
+        try:
+            doc = json.loads(text[start:end + 1])
+            if isinstance(doc, dict):
+                lowered = {str(k).strip().lower(): v for k, v in doc.items()}
+                for name in criteria:
+                    value = lowered.get(name.lower())
+                    if isinstance(value, bool) or not isinstance(value, (int, float)):
+                        continue
+                    scores[name] = max(1, min(10, int(round(float(value)))))
+        except (ValueError, TypeError):
+            pass
+    if len(scores) == len(criteria):
+        return scores
+
+    # Fall back to integers in order of appearance.
+    found = []
+    token = ""
+    for ch in text:
+        if ch.isdigit():
+            token += ch
+        else:
+            if token:
+                found.append(int(token))
+                token = ""
+    if token:
+        found.append(int(token))
+    usable = [n for n in found if 1 <= n <= 10]
+    if len(usable) >= len(criteria):
+        return {name: usable[i] for i, name in enumerate(criteria)}
+    raise ValueError(f"no usable scores in reply: {text.strip()[:120]!r}")
+
+
+def vl_render_bytes(res: Result, resample: int) -> str:
+    """The image as the model will see it: same crop as the training render,
+    scaled to something the projector will not immediately throw away."""
+    bw, bh = res.bucket
+    scale = min(1.0, VL_MAX_EDGE / max(bw, bh))
+    size = (max(1, round(bw * scale)), max(1, round(bh * scale)))
+    img, _fmt, _qt = load_source(res.path)
+    try:
+        out = img.resize(size, resample=resample, box=res.box)
+    finally:
+        img.close()
+    buf = io.BytesIO()
+    out.save(buf, "JPEG", quality=VL_JPEG_QUALITY, optimize=True)
+    out.close()
+    return base64.b64encode(buf.getvalue()).decode("ascii")
+
+
+def vl_score_image(res: Result, cfg: VLConfig, resample: int) -> dict[str, int]:
+    image_b64 = vl_render_bytes(res, resample)
+    payload = {
+        "model": cfg.model,
+        "messages": build_vl_messages(cfg, image_b64),
+        "temperature": 0,
+        "seed": 0,
+        "max_tokens": 200,
+        "stream": False,
+    }
+    last = None
+    for attempt in range(VL_RETRIES):
+        try:
+            doc = _http_json(cfg.chat_url, cfg.timeout, payload)
+            text = doc["choices"][0]["message"]["content"]
+            if isinstance(text, list):        # some servers return content parts
+                text = "".join(part.get("text", "") for part in text
+                               if isinstance(part, dict))
+            return parse_vl_reply(text or "", cfg.criteria)
+        except Exception as exc:
+            last = exc
+            if attempt < VL_RETRIES - 1:
+                time.sleep(0.5 * (attempt + 1))
+    raise RuntimeError(f"{type(last).__name__}: {last}")
+
+
+def blend_scores(vl_mean: float, technical: float) -> float:
+    """Weighted geometric mean of the model's opinion and the measured score.
+
+    Geometric rather than arithmetic so that a low factor actually bites: an
+    average lets a perfect critique carry a technically broken image, which is
+    the whole thing this blend is supposed to prevent.
+    """
+    vl = max(1.0, min(10.0, vl_mean))
+    tech = max(1.0, technical)
+    return math.exp(VL_WEIGHT * math.log(vl) + (1.0 - VL_WEIGHT) * math.log(tech))
+
+
+def load_vl_cache(prep_dir: Path, signature: str) -> dict:
+    path = prep_dir / VL_CACHE_FILENAME
+    if not path.is_file():
+        return {}
+    try:
+        doc = json.loads(path.read_text(encoding="utf-8"))
+        if doc.get("signature") != signature:
+            return {}                        # different model, or different ask
+        return doc.get("scores", {})
+    except Exception:
+        return {}
+
+
+def save_vl_cache(prep_dir: Path, cfg: VLConfig, results: list[Result],
+                  stamp: datetime) -> None:
+    scores = {}
+    for res in results:
+        if not res.vl_scores:
+            continue
+        try:
+            st = res.path.stat()
+        except OSError:
+            continue
+        scores[res.name] = {"key": [st.st_size, st.st_mtime_ns],
+                            "scores": res.vl_scores}
+    doc = {
+        "note": "k2prep --vl scores. Keyed to the model, the criteria and the "
+                "prompt; change any of them and this file is discarded. Safe "
+                "to delete.",
+        "signature": cfg.signature(),
+        "endpoint": cfg.endpoint,
+        "model": cfg.model,
+        "criteria": cfg.criteria,
+        "updated": f"{stamp:%Y-%m-%d %H:%M:%S}",
+        "scores": scores,
+    }
+    prep_dir.mkdir(parents=True, exist_ok=True)
+    (prep_dir / VL_CACHE_FILENAME).write_text(
+        json.dumps(doc, indent=1) + "\n", encoding="utf-8")
+
+
+def apply_cached_vl(res: Result, cache: dict, criteria: list[str]) -> bool:
+    entry = cache.get(res.name)
+    if not entry:
+        return False
+    try:
+        st = res.path.stat()
+    except OSError:
+        return False
+    if list(entry.get("key", [])) != [st.st_size, st.st_mtime_ns]:
+        return False
+    scores = entry.get("scores") or {}
+    if set(scores) != set(criteria):
+        return False
+    res.vl_scores = {k: int(v) for k, v in scores.items()}
+    res.vl_mean = statistics.fmean(res.vl_scores.values())
+    return True
+
+
 @dataclass
 class QualityTier:
     index: int                  # 1 = best
@@ -1278,7 +1661,7 @@ def plan_quality_tiers(scored: list[Result], n_tiers: int) -> list[QualityTier]:
     Mutates sort_tier on each result. Returns one QualityTier per tier, in
     order, including any that came out empty.
     """
-    ordered = sorted(scored, key=lambda r: (-r.composite_fine, r.name))
+    ordered = sorted(scored, key=lambda r: (-r.rank_fine, r.name))
     n = len(ordered)
     tiers = [QualityTier(index=i + 1, name=f"{QUALITY_DIR_PREFIX}{i + 1}")
              for i in range(n_tiers)]
@@ -1302,7 +1685,7 @@ def plan_quality_tiers(scored: list[Result], n_tiers: int) -> list[QualityTier]:
                 lo = hi = max(floor_pos, min(ideal, ceil_pos))
             best_pos, best_key = lo, None
             for pos in range(lo, hi + 1):
-                gap = ordered[pos - 1].composite_fine - ordered[pos].composite_fine
+                gap = ordered[pos - 1].rank_fine - ordered[pos].rank_fine
                 key = (gap, -abs(pos - ideal))    # ties settle nearest the ideal
                 if best_key is None or key > best_key:
                     best_key, best_pos = key, pos
@@ -1320,12 +1703,15 @@ def plan_quality_tiers(scored: list[Result], n_tiers: int) -> list[QualityTier]:
             res.sort_tier = tier.index
             res.sort_dirname = tier.name
         tier.count = len(group)
-        tier.best = group[0].composite_fine
-        tier.worst = group[-1].composite_fine
-        tier.score_hi = group[0].composite
-        tier.score_lo = group[-1].composite
+        tier.best = group[0].rank_fine
+        tier.worst = group[-1].rank_fine
+        # max/min rather than the endpoints: with --vl the ranking is the blend,
+        # so the technical score is not monotone within a tier and the first and
+        # last members are not its extremes.
+        tier.score_hi = max(r.composite for r in group)
+        tier.score_lo = min(r.composite for r in group)
         if stop < n:
-            tier.gap_below = ordered[stop - 1].composite_fine - ordered[stop].composite_fine
+            tier.gap_below = ordered[stop - 1].rank_fine - ordered[stop].rank_fine
             tier.tied_break = tier.gap_below <= EPS
     return tiers
 
@@ -1565,7 +1951,7 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     w(f"started     : {started:%Y-%m-%d %H:%M:%S}")
     w(f"finished    : {finished:%Y-%m-%d %H:%M:%S}")
     w(f"options     : threshold={args.threshold} filter={args.filter} "
-      f"format={fmt_desc} threads={args.threads}"
+      f"format={fmt_desc} threads={args.local_threads}"
       f"{' force=on' if args.force else ''}"
       f"{' no-merge=on' if args.no_merge else ''}")
     w(f"tiers       : {', '.join(str(t) for t in TIERS)}   "
@@ -1851,7 +2237,7 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     w("TIMING")
     rate = total / elapsed if elapsed > 0 else 0.0
     w(f"  scanned  {_fmt_int(total)} images in {_hms(elapsed)} "
-      f"({rate:.1f} img/s, {args.threads} threads)")
+      f"({rate:.1f} img/s, {args.local_threads} threads)")
 
     return "\n".join(line.rstrip() for line in out) + "\n"
 
@@ -1864,7 +2250,8 @@ def _score_span(tier: "QualityTier") -> str:
 def build_sort_report(args, folder: Path, results: list[Result],
                       unknown: list[str], stale: list[str], started: datetime,
                       finished: datetime, elapsed: float, notes: list[str],
-                      stage: str, tiers: list["QualityTier"]) -> str:
+                      stage: str, tiers: list["QualityTier"],
+                      vl_cfg: "VLConfig | None" = None) -> str:
     out: list[str] = []
     w = out.append
 
@@ -1884,7 +2271,7 @@ def build_sort_report(args, folder: Path, results: list[Result],
                        if stage == STAGE_PRELIMINARY else 'final - as placed'}")
     w(f"started     : {started:%Y-%m-%d %H:%M:%S}")
     w(f"finished    : {finished:%Y-%m-%d %H:%M:%S}")
-    w(f"options     : mode={verb} filter={args.filter} threads={args.threads}"
+    w(f"options     : mode={verb} filter={args.filter} threads={args.local_threads}"
       f"{' force=on' if args.force else ''}")
     if dynamic:
         w(f"tiers       : {args.sort}, cut from this folder's own distribution, "
@@ -1903,6 +2290,22 @@ def build_sort_report(args, folder: Path, results: list[Result],
     w("              would this be as a training image' has one answer, so it is")
     w("              asked once, at one resolution. An image already at or below")
     w(f"              the {SORT_TIER} tier is scored as it is, never upscaled first.")
+    if vl_cfg is not None:
+        w(f"model       : {vl_cfg.model} at {vl_cfg.endpoint}, no key sent")
+        w(f"criteria    : {', '.join(vl_cfg.criteria)}")
+        w(f"rank        : geometric mean of the model's score (weight "
+          f"{VL_WEIGHT:.2f}) and the")
+        w(f"              measured technical score (weight {1 - VL_WEIGHT:.2f}). "
+          f"Geometric, so a")
+        w("              technically broken image cannot be carried by a perfect")
+        w("              critique; weighted toward the model, because it answers")
+        w("              the question you asked and the metrics cannot.")
+        w("              An image the model could not grade is ranked on its")
+        w("              technical score alone - neither rewarded nor punished.")
+        w("reproducible: NO. A model can answer differently between runs and a")
+        w("              different model will disagree outright. The technical")
+        w("              columns beside it are still exact, and the cached")
+        w("              opinions make a re-run of THIS folder stable.")
     if args.move:
         w("policy      : --move REMOVES each image and its caption from the source")
         w("              folder. This is the only k2prep mode that does. Each")
@@ -1943,21 +2346,56 @@ def build_sort_report(args, folder: Path, results: list[Result],
     w(f"{heading}  ({_fmt_int(len(listed))} images)")
     w("-" * 66)
     dest_col = "destination" if stage == STAGE_FINAL else ""
+    vl_cols = f"{'vl':>5} {'rank':>6} " if vl_cfg is not None else ""
     w(f"{'filename':<{name_w}}{'source':<12}{'scored at':<12}{'crop%':>6}  "
-      f"{'Q~':>3} {'B':>3} {'D':>3} {'score':>6} {'quality':>8}  {dest_col}")
-    for r in sorted(listed, key=lambda r: (-r.composite_fine, r.name)):
+      f"{'Q~':>3} {'B':>3} {'D':>3} {'score':>6} {'tech':>7} {vl_cols} {dest_col}")
+    for r in sorted(listed, key=lambda r: (-r.rank_fine, r.name)):
         src = f"{r.src_w}x{r.src_h}"
         at = f"{r.bucket[0]}x{r.bucket[1]}" if r.bucket else "-"
         native = "" if r.bucket != r.crop else " ="
         dest = f"  {r.sort_dirname}/" if stage == STAGE_FINAL and r.sort_dirname else ""
+        cells = ""
+        if vl_cfg is not None:
+            vl = f"{r.vl_mean:.1f}" if r.vl_mean is not None else "n/a"
+            cells = f"{vl:>5} {r.rank_fine:>6.2f} "
         w(f"{r.name:<{name_w}}{src:<12}{at + native:<12}{r.crop_pct:>5.1f}%  "
           f"{_score_cell(r.q):>3} {_score_cell(r.b):>3} {_score_cell(r.d):>3} "
-          f"{r.composite:>6} {r.composite_fine:>8.2f}{dest}")
+          f"{r.composite:>6} {r.composite_fine:>7.2f} {cells}{dest}")
     if listed:
         w("")
         w("'=' marks an image scored at its own size because it was already at or")
         w(f"below the {SORT_TIER} tier. Q~ is informational; the score is min(B, D).")
+        if vl_cfg is not None:
+            w("'tech' is the measured score, 'vl' the model's mean over your")
+            w("criteria, 'rank' the blend the tiers are actually cut on.")
     w("")
+
+    if vl_cfg is not None:
+        graded = [r for r in scored if r.vl_scores]
+        w(f"MODEL SCORES BY CRITERION  ({_fmt_int(len(graded))} images)")
+        w("-" * 66)
+        if graded:
+            heads = "".join(f"{c[:11]:>12}" for c in vl_cfg.criteria)
+            w(f"{'filename':<{name_w}}{heads}{'mean':>7}")
+            for r in sorted(graded, key=lambda r: (-r.rank_fine, r.name)):
+                cells = "".join(f"{r.vl_scores.get(c, '-'):>12}"
+                                for c in vl_cfg.criteria)
+                w(f"{r.name:<{name_w}}{cells}{r.vl_mean:>7.1f}")
+            w("")
+            w("Per-criterion scores are averaged, not minimised: the technical")
+            w("metrics use min() because a compression fault is disqualifying,")
+            w("whereas these describe what you asked for, and a partial match is")
+            w("a real answer rather than a failure.")
+        w("")
+
+        failed = [r for r in scored if r.vl_mean is None]
+        w(f"MODEL COULD NOT GRADE  ({_fmt_int(len(failed))} images)")
+        w("-" * 66)
+        if failed:
+            w("Ranked on their technical score alone.")
+        for r in sorted(failed, key=lambda r: r.name):
+            w(f"{r.name:<{name_w}}{r.vl_error or 'not attempted'}")
+        w("")
 
     w(f"ALREADY IN PLACE  ({_fmt_int(len(present))} images)")
     w("-" * 66)
@@ -2010,6 +2448,17 @@ def build_sort_report(args, folder: Path, results: list[Result],
         pct = 100.0 * n / max(len(scored), 1)
         w(f"  {score:>2}  {bar:<40}  {_fmt_int(n):>8}  {pct:>5.1f}%")
     w("")
+    if vl_cfg is not None:
+        graded = [r for r in scored if r.vl_mean is not None]
+        if graded:
+            w("MODEL SCORE, PER CRITERION (mean over the folder)")
+            for c in vl_cfg.criteria:
+                vals = [r.vl_scores[c] for r in graded if c in (r.vl_scores or {})]
+                if vals:
+                    w(f"  {c[:28]:<30}{statistics.fmean(vals):>6.2f}"
+                      f"   min {min(vals)}  max {max(vals)}")
+            w("")
+
     if stage == STAGE_FINAL and dynamic and tiers:
         w("TIER DISTRIBUTION")
         peak = max((t.count for t in tiers), default=0)
@@ -2021,7 +2470,7 @@ def build_sort_report(args, folder: Path, results: list[Result],
     w("TIMING")
     rate = len(results) / elapsed if elapsed > 0 else 0.0
     w(f"  scored   {_fmt_int(len(results))} images in {_hms(elapsed)} "
-      f"({rate:.1f} img/s, {args.threads} threads)")
+      f"({rate:.1f} img/s, {args.local_threads} threads)")
     return "\n".join(line.rstrip() for line in out) + "\n"
 
 
@@ -2155,8 +2604,11 @@ def parse_args(argv=None):
                    help="Write PNG instead of JPEG q97 4:4:4.")
     p.add_argument("--filter", choices=sorted(RESAMPLE_FILTERS), default="lanczos",
                    help="Resampling filter. Default lanczos.")
-    p.add_argument("--threads", type=_threads_arg, default=4, metavar="N",
-                   help="Worker threads, 1..32. Default 4.")
+    p.add_argument("--threads", type=_threads_arg, default=None, metavar="N",
+                   help="Worker threads, 1..32. Default 4, or 1 for --vl "
+                        "requests, since llama.cpp, koboldcpp and LM Studio all "
+                        "serve one request at a time unless started with "
+                        "parallel slots. Set it explicitly if yours has them.")
     p.add_argument("--force", action="store_true",
                    help="Overwrite existing outputs instead of skipping.")
     p.add_argument("--sort", nargs="?", type=_sort_tiers_arg, metavar="N",
@@ -2176,6 +2628,15 @@ def parse_args(argv=None):
                    help="With --sort, move the originals instead of copying "
                         "them. This is the only k2prep option that removes "
                         "anything from the source folder.")
+    p.add_argument("--vl", metavar="CRITERIA",
+                   help=f"With --sort, also ask a local vision-language model "
+                        f"to rate each image on your own criteria, given as a "
+                        f"comma-separated list (up to {VL_MAX_CRITERIA}), e.g. "
+                        f"--vl \"sharpness, composition, lighting\". The "
+                        f"model's opinion is blended with the measured "
+                        f"technical score rather than replacing it. Needs a "
+                        f"{VL_ENV_FILENAME} naming a local endpoint; see "
+                        f"{VL_SAMPLE_ENV}. Makes the run non-reproducible.")
     p.add_argument("--single-pass", action="store_true", dest="single_pass",
                    help="Score the source image and reject before rendering, "
                         "instead of scoring the rendered result. Faster, but "
@@ -2192,6 +2653,29 @@ def parse_args(argv=None):
     if args.move and args.sort is None:
         p.error("--move is only available with --sort; on its own it would have "
                 "nothing to move and would still delete your originals")
+    if args.vl is not None and args.sort is None:
+        p.error("--vl is only available with --sort. A model's opinion is not "
+                "reproducible, and --threshold has to mean the same thing on "
+                "every run; sorting only needs the ordering, which is what a "
+                "model is actually good at")
+    args.vl_criteria = []
+    if args.vl is not None:
+        seen = []
+        for raw in args.vl.split(","):
+            name = " ".join(raw.split()).strip()
+            if name and name.lower() not in [s.lower() for s in seen]:
+                seen.append(name)
+        if not seen:
+            p.error("--vl needs at least one criterion, e.g. "
+                    "--vl \"sharpness, composition\"")
+        if len(seen) > VL_MAX_CRITERIA:
+            p.error(f"--vl takes at most {VL_MAX_CRITERIA} criteria, got "
+                    f"{len(seen)}; a long list dilutes every one of them")
+        args.vl_criteria = seen
+    # --threads is one knob with two sensible defaults: local work is CPU-bound
+    # and likes 4, a local inference server is usually single-slot and likes 1.
+    args.local_threads = args.threads if args.threads is not None else 4
+    args.vl_threads = args.threads if args.threads is not None else 1
     return args
 
 
@@ -2209,6 +2693,20 @@ def run_sort(args, folder: Path, prep_dir: Path, reports_dir: Path,
     running in the same pass - the next run would find no sources and sweep the
     tier folders empty.
     """
+    # The endpoint is checked before a single image is opened: a typo in .env
+    # or a server that is not running should cost a sentence, not a long wait.
+    vl_cfg = None
+    if args.vl_criteria:
+        try:
+            vl_cfg = load_vl_config(args.vl_criteria)
+            loaded = vl_preflight(vl_cfg)
+        except VLUnavailable as exc:
+            print(f"error: --vl unavailable: {exc}", file=sys.stderr)
+            return 2
+        print(f"--vl endpoint {vl_cfg.endpoint}  model {vl_cfg.model}  "
+              f"[server reports: {loaded}]")
+        print(f"     criteria: {', '.join(vl_cfg.criteria)}")
+
     notes: list[str] = []
     for flag, why in (("threshold", "nothing is rejected when sorting; every "
                                     "image goes to the folder for its score"),
@@ -2224,7 +2722,7 @@ def run_sort(args, folder: Path, prep_dir: Path, reports_dir: Path,
 
     results: list[Result] = []
     if images:
-        with ThreadPoolExecutor(max_workers=args.threads) as pool:
+        with ThreadPoolExecutor(max_workers=args.local_threads) as pool:
             futures = [pool.submit(analyse_for_sort, p) for p in images]
             for fut in tqdm(as_completed(futures), total=len(futures),
                             desc="scanning ", unit="img"):
@@ -2246,7 +2744,7 @@ def run_sort(args, folder: Path, prep_dir: Path, reports_dir: Path,
             else:
                 pending.append(r)
         if pending:
-            with ThreadPoolExecutor(max_workers=args.threads) as pool:
+            with ThreadPoolExecutor(max_workers=args.local_threads) as pool:
                 futures = {pool.submit(score_rendered, r, resample): r
                            for r in pending}
                 for fut in tqdm(as_completed(futures), total=len(futures),
@@ -2271,9 +2769,51 @@ def run_sort(args, folder: Path, prep_dir: Path, reports_dir: Path,
     prelim_path.write_text(
         build_sort_report(args, folder, results, unknown, [], started,
                           datetime.now(), time.perf_counter() - t0, notes,
-                          STAGE_PRELIMINARY, []),
+                          STAGE_PRELIMINARY, [], None),
         encoding="utf-8",
     )
+
+    # -- ask the model, after the preliminary report is safely on disk -------
+    # Deliberately last: it is the slow, fallible, non-reproducible half, and if
+    # it dies halfway the technical scores are already written and cached.
+    if vl_cfg is not None and scored:
+        vl_cache = {} if args.force else load_vl_cache(prep_dir, vl_cfg.signature())
+        pending = [r for r in scored
+                   if not apply_cached_vl(r, vl_cache, vl_cfg.criteria)]
+        vl_hits = len(scored) - len(pending)
+        consecutive = 0
+        abandoned = False
+        if pending:
+            with ThreadPoolExecutor(max_workers=args.vl_threads) as pool:
+                futures = {pool.submit(vl_score_image, r, vl_cfg, resample): r
+                           for r in pending}
+                for fut in tqdm(as_completed(futures), total=len(futures),
+                                desc="asking   ", unit="img"):
+                    r = futures[fut]
+                    if abandoned:
+                        fut.cancel()
+                        continue
+                    try:
+                        r.vl_scores = fut.result()
+                        r.vl_mean = statistics.fmean(r.vl_scores.values())
+                        consecutive = 0
+                    except Exception as exc:
+                        r.vl_error = f"{type(exc).__name__}: {exc}"
+                        consecutive += 1
+                        if consecutive >= VL_GIVE_UP_AFTER:
+                            abandoned = True
+        save_vl_cache(prep_dir, vl_cfg, results, datetime.now())
+        graded = sum(1 for r in scored if r.vl_mean is not None)
+        notes.append(f"model graded {graded} of {len(scored)} images "
+                     f"({vl_hits} reused from {VL_CACHE_FILENAME}).")
+        if abandoned:
+            notes.append(f"gave up on the model after {VL_GIVE_UP_AFTER} "
+                         f"failures in a row; the rest are ranked on their "
+                         f"technical score alone.")
+        elif graded < len(scored):
+            notes.append("images the model could not grade fall back to their "
+                         "technical score, which is neither a reward nor a "
+                         "penalty.")
 
     # -- decide where each image goes ----------------------------------------
     tiers: list[QualityTier] = []
@@ -2307,7 +2847,8 @@ def run_sort(args, folder: Path, prep_dir: Path, reports_dir: Path,
     report_path = _free_path(reports_dir, f"sort-{stamp}-final", ".txt")
     report_path.write_text(
         build_sort_report(args, folder, results, unknown, stale,
-                          started, finished, elapsed, notes, STAGE_FINAL, tiers),
+                          started, finished, elapsed, notes, STAGE_FINAL,
+                          tiers, vl_cfg),
         encoding="utf-8",
     )
 
@@ -2383,7 +2924,7 @@ def main(argv=None) -> int:
     worker = analyse if args.single_pass else analyse_geometry
     results: list[Result] = []
     if images:
-        with ThreadPoolExecutor(max_workers=args.threads) as pool:
+        with ThreadPoolExecutor(max_workers=args.local_threads) as pool:
             futures = [pool.submit(worker, p) for p in images]
             for fut in tqdm(as_completed(futures), total=len(futures),
                             desc="analysing" if args.single_pass else "scanning ",
@@ -2426,7 +2967,7 @@ def main(argv=None) -> int:
             else:
                 todo.append(r)
         if todo:
-            with ThreadPoolExecutor(max_workers=args.threads) as pool:
+            with ThreadPoolExecutor(max_workers=args.local_threads) as pool:
                 futures = {pool.submit(score_rendered, r, resample): r for r in todo}
                 for fut in tqdm(as_completed(futures), total=len(futures),
                                 desc="scoring  ", unit="img"):
@@ -2476,7 +3017,7 @@ def main(argv=None) -> int:
     if not args.report and to_write:
         for tier in sorted({r.tier for r in to_write}):
             (prep_dir / str(tier)).mkdir(parents=True, exist_ok=True)
-        with ThreadPoolExecutor(max_workers=args.threads) as pool:
+        with ThreadPoolExecutor(max_workers=args.local_threads) as pool:
             futures = {
                 pool.submit(write_output, r, prep_dir / str(r.tier), resample, ext): r
                 for r in to_write
