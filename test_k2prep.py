@@ -10,6 +10,8 @@ section 4.3 (the per-tier family table), and the pure-function half of the
 acceptance criteria in section 12.
 """
 
+from collections import defaultdict
+
 import k2prep as k
 
 
@@ -245,6 +247,104 @@ def test_sort_score_maps_to_its_folder():
     prep = Path("/tmp/_prep")
     for score in range(1, 11):
         assert k.sort_dir_for(prep, score).name == f"{k.SORT_DIR_PREFIX}{score}"
+
+
+def test_fine_score_floors_to_the_band_score():
+    """The continuous value exists to rank within a band; it must never
+    disagree with the integer score the rest of the tool uses."""
+    import math
+    for i in range(1, 1200):
+        v = i / 2000
+        assert math.floor(k.fine_score(v, k.D_RENDERED_BANDS, False)) == \
+            k.score_d_rendered(v), v
+        assert math.floor(k.fine_score(v, k.B_RENDERED_BANDS, True)) == \
+            k.score_b_rendered(v), v
+
+
+def test_fine_score_is_monotone():
+    d = [k.fine_score(v, k.D_RENDERED_BANDS, False)
+         for v in (0.001, 0.02, 0.06, 0.14, 0.19, 0.23, 0.5, 5.0)]
+    assert all(a < b for a, b in zip(d, d[1:])), d      # more detail is better
+    b = [k.fine_score(v, k.B_RENDERED_BANDS, True)
+         for v in (0.001, 0.009, 0.02, 0.05, 0.08, 0.3, 3.0)]
+    assert all(a > b2 for a, b2 in zip(b, b[1:])), b    # more blocking is worse
+
+
+def _fake(name, fine):
+    from pathlib import Path
+    r = k.Result(path=Path(name), name=name)
+    r.scored = True
+    r.composite_fine = fine
+    r.composite = int(fine)
+    return r
+
+
+def test_every_tier_is_populated_however_uniform_the_folder():
+    """The whole point of --sort N: a folder of uniformly excellent images
+    still has a best third and a worst third."""
+    for spread in (0.001, 0.05, 3.0):
+        images = [_fake(f"i{i}.jpg", 10.0 + i * spread / 40) for i in range(40)]
+        for n in range(2, 11):
+            for r in images:
+                r.sort_tier = 0
+            tiers = k.plan_quality_tiers(images, n)
+            assert len(tiers) == n
+            assert all(t.count > 0 for t in tiers), (spread, n,
+                                                     [t.count for t in tiers])
+            assert sum(t.count for t in tiers) == len(images)
+
+
+def test_tiers_are_ordered_best_first():
+    images = [_fake(f"i{i}.jpg", 1.0 + i * 0.25) for i in range(36)]
+    k.plan_quality_tiers(images, 4)
+    by_tier = defaultdict(list)
+    for r in images:
+        by_tier[r.sort_tier].append(r.composite_fine)
+    for tier in range(1, 4):
+        assert min(by_tier[tier]) >= max(by_tier[tier + 1]), by_tier
+
+
+def test_a_lone_outlier_does_not_take_a_tier_to_itself():
+    """One superb image among ordinary ones must not push everything else down
+    a grade - the failure mode absolute bands already have."""
+    images = [_fake("star.jpg", 10.9)] + [_fake(f"i{i}.jpg", 3.0 + i * 0.01)
+                                          for i in range(29)]
+    tiers = k.plan_quality_tiers(images, 3)
+    assert tiers[0].count > 1, tiers[0].count
+    star = next(r for r in images if r.name == "star.jpg")
+    assert star.sort_tier == 1
+
+
+def test_cuts_prefer_a_real_gap_near_the_ideal_position():
+    """30 images, N=3, with a chasm at 12 rather than the ideal 10: the cut
+    should slide to the gap instead of splitting a tight cluster."""
+    images = ([_fake(f"a{i}.jpg", 9.0 + i * 0.01) for i in range(12)] +
+              [_fake(f"b{i}.jpg", 5.0 + i * 0.01) for i in range(18)])
+    tiers = k.plan_quality_tiers(images, 3)
+    assert tiers[0].count == 12, [t.count for t in tiers]
+    assert tiers[0].gap_below > 3.0
+
+
+def test_fewer_images_than_tiers_leaves_tiers_empty():
+    images = [_fake("a.jpg", 9.0), _fake("b.jpg", 4.0)]
+    tiers = k.plan_quality_tiers(images, 5)
+    assert [t.count for t in tiers] == [1, 1, 0, 0, 0]
+    assert images[0].sort_tier == 1 and images[1].sort_tier == 2
+
+
+def test_sort_tier_count_is_validated():
+    import contextlib, io
+    for bad in ("0", "1", "11", "-3", "abc"):
+        with contextlib.redirect_stderr(io.StringIO()):
+            try:
+                k.parse_args(["f", "--sort", bad])
+            except SystemExit as exc:
+                assert exc.code != 0
+            else:
+                raise AssertionError(f"--sort {bad} was accepted")
+    assert k.parse_args(["f", "--sort"]).sort == k.SORT_ABSOLUTE
+    for good in range(2, 11):
+        assert k.parse_args(["f", "--sort", str(good)]).sort == good
 
 
 def test_move_requires_sort():

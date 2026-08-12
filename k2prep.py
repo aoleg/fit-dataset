@@ -427,6 +427,51 @@ def score_d_rendered(ratio: float) -> int:
     return 1
 
 
+def fine_score(value: float, bands, lower_is_better: bool) -> float:
+    """The band score plus the position within that band, as a float.
+
+    A 1-10 integer leaves at most ten distinct values, which is far too coarse
+    to rank a folder by: --sort N has to split several hundred images into N
+    groups, and with ten possible values most of them are ties broken by nothing
+    at all. This keeps the integer part exactly equal to the band score -
+    floor(fine_score(v)) == score_*(v) always - and fills in the fraction from
+    where the measurement actually sits inside its band.
+
+    The open-ended top and bottom bands are extrapolated, so a genuinely
+    exceptional image still outranks a merely good one.
+    """
+    if lower_is_better:                       # B: smaller ratio is better
+        first_hi = bands[0][0]
+        if value <= first_hi:
+            frac = 1.0 - (value / first_hi if first_hi > 0 else 0.0)
+            return bands[0][1] + min(0.999, max(0.0, frac))
+        for i in range(1, len(bands)):
+            hi, s = bands[i]
+            if value <= hi:
+                lo = bands[i - 1][0]
+                return s + (hi - value) / max(hi - lo, EPS)
+        last = bands[-1][0]
+        return 1.0 + (min(0.999, last / value) if value > 0 else 0.0)
+
+    first_lo = bands[0][0]                    # D: larger ratio is better
+    if value >= first_lo:
+        # The top band is open-ended, and clamping it would tie every genuinely
+        # exceptional image together at exactly the point where --sort N needs
+        # to tell them apart. t/(1+t) approaches 1 without reaching it, so the
+        # ordering survives all the way up and the integer part stays 10.
+        growth = first_lo / max(bands[1][0], EPS)
+        span = math.log(growth) if growth > 1.0 else 1.0
+        t = math.log(max(value, first_lo) / first_lo) / span
+        return bands[0][1] + t / (1.0 + t)
+    for i in range(1, len(bands)):
+        lo, s = bands[i]
+        if value >= lo:
+            hi = bands[i - 1][0]
+            return s + (value - lo) / max(hi - lo, EPS)
+    last = bands[-1][0]
+    return 1.0 + (min(0.999, value / last) if last > 0 else 0.0)
+
+
 # ---------------------------------------------------------------------------
 # 6.3  D - detail
 # ---------------------------------------------------------------------------
@@ -580,6 +625,7 @@ class Result:
     d: int | None = None
     d_ratio: float = 0.0
     composite: int = 10
+    composite_fine: float = 10.0   # composite + position within its band
     no_metrics: bool = False
     scored: bool = False          # two-pass: has the rendered score been taken?
     # The bucket the score was measured at. Kept separate from `bucket` because
@@ -590,6 +636,8 @@ class Result:
     # --sort
     sort_dest: Path | None = None
     sort_action: str = ""
+    sort_tier: int = 0            # 1 = best, in --sort N mode
+    sort_dirname: str = ""
 
     out_stem: str = ""
     out_name: str = ""
@@ -736,6 +784,12 @@ def score_rendered(res: Result, resample: int) -> None:
     scores = [s for s in (res.b, res.d) if s is not None]
     res.composite = min(scores) if scores else 10
     res.no_metrics = not scores
+
+    # floor is monotone, so the fine composite floors to exactly the integer one
+    fine = [fine_score(res.d_ratio, D_RENDERED_BANDS, False)] if res.d is not None else []
+    if res.b is not None:
+        fine.append(fine_score(res.b_ratio, B_RENDERED_BANDS, True))
+    res.composite_fine = min(fine) if fine else float(res.composite)
     res.scored = True
 
 
@@ -795,7 +849,7 @@ def analyse(path: Path) -> Result:
 # edited source is rescored; --force ignores it entirely.
 
 CACHE_FILENAME = "metrics-cache.json"
-CACHE_VERSION = 2
+CACHE_VERSION = 3
 
 
 def load_score_cache(prep_dir: Path) -> dict:
@@ -837,6 +891,7 @@ def apply_cached_score(res: Result, cache: dict) -> bool:
     res.d = entry["d"]
     res.d_ratio = entry["d_ratio"]
     res.composite = entry["composite"]
+    res.composite_fine = entry["composite_fine"]
     res.no_metrics = entry["no_metrics"]
     res.scored = True
     return True
@@ -855,7 +910,8 @@ def save_score_cache(prep_dir: Path, results: list[Result], stamp: datetime) -> 
             "key": key, "q_est": res.q_est, "q": res.q,
             "b": res.b, "b_ratio": res.b_ratio, "b_period": res.b_period,
             "d": res.d, "d_ratio": res.d_ratio,
-            "composite": res.composite, "no_metrics": res.no_metrics,
+            "composite": res.composite, "composite_fine": res.composite_fine,
+            "no_metrics": res.no_metrics,
         }
     doc = {
         "note": "k2prep rendered-image scores, cached so that re-running at a "
@@ -1172,10 +1228,112 @@ def sort_dir_for(prep_dir: Path, score: int) -> Path:
     return prep_dir / f"{SORT_DIR_PREFIX}{score}"
 
 
+# ---------------------------------------------------------------------------
+# --sort N: dynamic quality tiers
+# ---------------------------------------------------------------------------
+#
+# Absolute bands answer "how good is this image". Asked to fill N tiers, the
+# question changes to "how good is this image *for this folder*", and the two
+# want different machinery. A folder of uniformly excellent photographs has a
+# best third and a worst third just as much as a mixed one does, and telling
+# the user their 400 images are all quality1 is useless for triage.
+#
+# So tiers are cut by rank, not by value. Rank alone would split ties
+# arbitrarily and ignore real structure in the data, so each cut is allowed to
+# slide within a window around its ideal position and settle on the largest gap
+# it can find there. Balanced where the data is smooth, natural where it is
+# clustered.
+#
+# The window is what stops a couple of outliers from defining a tier. A pure
+# natural-breaks fit would happily give two exceptional images a tier of their
+# own and push everything else down a grade, which is exactly the failure the
+# absolute bands already have.
+
+QUALITY_DIR_PREFIX = "quality"
+SORT_ABSOLUTE = -1              # sentinel: --sort given with no number
+MIN_QUALITY_TIERS = 2
+MAX_QUALITY_TIERS = 10
+
+# How far a cut may slide from its ideal position, as a fraction of one tier's
+# width, while hunting for a natural break.
+QUALITY_CUT_WINDOW = 0.35
+
+
+@dataclass
+class QualityTier:
+    index: int                  # 1 = best
+    name: str
+    count: int = 0
+    best: float = 0.0
+    worst: float = 0.0
+    score_hi: int = 0
+    score_lo: int = 0
+    gap_below: float | None = None   # size of the break under this tier
+    tied_break: bool = False         # the break landed inside equal values
+
+
+def plan_quality_tiers(scored: list[Result], n_tiers: int) -> list[QualityTier]:
+    """Split the scored images into n_tiers by rank, best first.
+
+    Mutates sort_tier on each result. Returns one QualityTier per tier, in
+    order, including any that came out empty.
+    """
+    ordered = sorted(scored, key=lambda r: (-r.composite_fine, r.name))
+    n = len(ordered)
+    tiers = [QualityTier(index=i + 1, name=f"{QUALITY_DIR_PREFIX}{i + 1}")
+             for i in range(n_tiers)]
+    if n == 0:
+        return tiers
+
+    if n <= n_tiers:
+        # Not enough images to fill every tier; hand them out from the top and
+        # leave the rest empty rather than inventing distinctions.
+        cuts = list(range(1, n))
+    else:
+        cuts = []
+        window = max(1, round(QUALITY_CUT_WINDOW * n / n_tiers))
+        floor_pos = 1
+        for i in range(1, n_tiers):
+            ideal = round(i * n / n_tiers)
+            ceil_pos = n - (n_tiers - i)          # leave room for what follows
+            lo = max(floor_pos, ideal - window)
+            hi = min(ceil_pos, ideal + window)
+            if lo > hi:
+                lo = hi = max(floor_pos, min(ideal, ceil_pos))
+            best_pos, best_key = lo, None
+            for pos in range(lo, hi + 1):
+                gap = ordered[pos - 1].composite_fine - ordered[pos].composite_fine
+                key = (gap, -abs(pos - ideal))    # ties settle nearest the ideal
+                if best_key is None or key > best_key:
+                    best_key, best_pos = key, pos
+            cuts.append(best_pos)
+            floor_pos = best_pos + 1
+
+    bounds = [0] + cuts + [n]
+    for i in range(len(bounds) - 1):
+        start, stop = bounds[i], bounds[i + 1]
+        if start >= stop or i >= n_tiers:
+            continue
+        tier = tiers[i]
+        group = ordered[start:stop]
+        for res in group:
+            res.sort_tier = tier.index
+            res.sort_dirname = tier.name
+        tier.count = len(group)
+        tier.best = group[0].composite_fine
+        tier.worst = group[-1].composite_fine
+        tier.score_hi = group[0].composite
+        tier.score_lo = group[-1].composite
+        if stop < n:
+            tier.gap_below = ordered[stop - 1].composite_fine - ordered[stop].composite_fine
+            tier.tied_break = tier.gap_below <= EPS
+    return tiers
+
+
 def place_sorted(res: Result, prep_dir: Path, move: bool, force: bool,
                  dry_run: bool) -> None:
     """Put one source image, and its caption, in the folder for its score."""
-    dest_dir = sort_dir_for(prep_dir, res.composite)
+    dest_dir = prep_dir / res.sort_dirname
     dest = dest_dir / res.name
     res.sort_dest = dest
 
@@ -1216,19 +1374,20 @@ def find_stale_sorted(prep_dir: Path, results: list[Result]) -> list[str]:
     surviving copy of a photograph, and no amount of tidiness is worth that
     risk; a stale entry after a band change is the user's to clear.
     """
-    wanted = {r.name: r.composite for r in results if r.composite and r.scored}
+    wanted = {r.name: r.sort_dirname for r in results if r.scored and r.sort_dirname}
     stale = []
-    for score in range(1, 11):
-        d = sort_dir_for(prep_dir, score)
+    folders = [f"{SORT_DIR_PREFIX}{i}" for i in range(1, 11)]
+    folders += [f"{QUALITY_DIR_PREFIX}{i}" for i in range(1, MAX_QUALITY_TIERS + 1)]
+    for folder in folders:
+        d = prep_dir / folder
         if not d.is_dir():
             continue
         for path in sorted(d.iterdir(), key=lambda p: p.name):
             if not path.is_file() or path.suffix.lower() == ".txt":
                 continue
             target = wanted.get(path.name)
-            if target is not None and target != score:
-                stale.append(f"{SORT_DIR_PREFIX}{score}/{path.name}"
-                             f"   (this run scores it {target})")
+            if target is not None and target != folder:
+                stale.append(f"{folder}/{path.name}   (this run files it under {target})")
     return stale
 
 
@@ -1697,10 +1856,15 @@ def build_report(args, folder: Path, results: list[Result], unknown: list[str],
     return "\n".join(line.rstrip() for line in out) + "\n"
 
 
+def _score_span(tier: "QualityTier") -> str:
+    return (f"{tier.score_hi}" if tier.score_hi == tier.score_lo
+            else f"{tier.score_hi}-{tier.score_lo}")
+
+
 def build_sort_report(args, folder: Path, results: list[Result],
                       unknown: list[str], stale: list[str], started: datetime,
-                      finished: datetime, elapsed: float,
-                      notes: list[str]) -> str:
+                      finished: datetime, elapsed: float, notes: list[str],
+                      stage: str, tiers: list["QualityTier"]) -> str:
     out: list[str] = []
     w = out.append
 
@@ -1710,15 +1874,31 @@ def build_sort_report(args, folder: Path, results: list[Result],
     scored = [r for r in results if r.scored]
     name_w = max([26] + [len(r.name) for r in results]) + 2
     verb = "move" if args.move else "copy"
+    dynamic = args.sort != SORT_ABSOLUTE
 
     w("k2prep sort report")
     w("=" * 66)
     w(f"folder      : {folder}")
     w(f"run         : {'sort / dry run, nothing placed' if args.report else 'sort'}")
+    w(f"stage       : {'preliminary - scores only, before tiers are decided'
+                       if stage == STAGE_PRELIMINARY else 'final - as placed'}")
     w(f"started     : {started:%Y-%m-%d %H:%M:%S}")
     w(f"finished    : {finished:%Y-%m-%d %H:%M:%S}")
     w(f"options     : mode={verb} filter={args.filter} threads={args.threads}"
       f"{' force=on' if args.force else ''}")
+    if dynamic:
+        w(f"tiers       : {args.sort}, cut from this folder's own distribution, "
+          f"{QUALITY_DIR_PREFIX}1 best.")
+        w("              Cuts are made by rank rather than by absolute score, so")
+        w("              every tier is populated whatever the folder looks like,")
+        w("              and a couple of outliers cannot define a grade. Each cut")
+        w(f"              may slide up to {QUALITY_CUT_WINDOW:.0%} of a tier's width to "
+          "settle on a")
+        w("              natural break in the scores.")
+    else:
+        w(f"tiers       : absolute 1-10 bands, {SORT_DIR_PREFIX}10 best. Bands the")
+        w("              folder has no images for stay empty. Pass --sort N for")
+        w("              N tiers cut from this folder's own distribution.")
     w(f"scoring     : every image is judged at the {SORT_TIER} tier - 'how good")
     w("              would this be as a training image' has one answer, so it is")
     w("              asked once, at one resolution. An image already at or below")
@@ -1734,18 +1914,46 @@ def build_sort_report(args, folder: Path, results: list[Result],
         w(f"note        : {note}")
     w("")
 
-    w(f"SORTED  ({_fmt_int(len(sorted_ok))} images)")
+    if stage == STAGE_FINAL and dynamic:
+        w(f"QUALITY TIERS  ({args.sort} tiers from {_fmt_int(len(scored))} images)")
+        w("-" * 66)
+        w(f"{'tier':<12}{'images':>8}{'share':>8}  {'score':<8}{'quality':<16}break")
+        for tier in tiers:
+            if not tier.count:
+                w(f"{tier.name:<12}{0:>8}{'':>8}  (empty, too few images to divide)")
+                continue
+            share = 100.0 * tier.count / max(len(scored), 1)
+            span = f"{tier.best:.2f}-{tier.worst:.2f}"
+            if tier.gap_below is None:
+                brk = "-"
+            elif tier.tied_break:
+                brk = "*** inside a tie, split is arbitrary"
+            else:
+                brk = f"gap {tier.gap_below:.2f}"
+            w(f"{tier.name:<12}{tier.count:>8}{share:>7.1f}%  "
+              f"{_score_span(tier):<8}{span:<16}{brk}")
+        w("")
+        w("'quality' is the composite plus its position inside that band, which is")
+        w("what the cuts are actually made on: a 1-10 integer is too coarse to rank")
+        w("a folder by, and would leave the split between tiers to chance.")
+        w("")
+
+    heading = "SCORED" if stage == STAGE_PRELIMINARY else "SORTED"
+    listed = scored if stage == STAGE_PRELIMINARY else sorted_ok
+    w(f"{heading}  ({_fmt_int(len(listed))} images)")
     w("-" * 66)
+    dest_col = "destination" if stage == STAGE_FINAL else ""
     w(f"{'filename':<{name_w}}{'source':<12}{'scored at':<12}{'crop%':>6}  "
-      f"{'Q~':>3} {'B':>3} {'D':>3} {'score':>6}  destination")
-    for r in sorted(sorted_ok, key=lambda r: (-r.composite, r.name)):
+      f"{'Q~':>3} {'B':>3} {'D':>3} {'score':>6} {'quality':>8}  {dest_col}")
+    for r in sorted(listed, key=lambda r: (-r.composite_fine, r.name)):
         src = f"{r.src_w}x{r.src_h}"
         at = f"{r.bucket[0]}x{r.bucket[1]}" if r.bucket else "-"
         native = "" if r.bucket != r.crop else " ="
+        dest = f"  {r.sort_dirname}/" if stage == STAGE_FINAL and r.sort_dirname else ""
         w(f"{r.name:<{name_w}}{src:<12}{at + native:<12}{r.crop_pct:>5.1f}%  "
           f"{_score_cell(r.q):>3} {_score_cell(r.b):>3} {_score_cell(r.d):>3} "
-          f"{r.composite:>6}  {SORT_DIR_PREFIX}{r.composite}/")
-    if sorted_ok:
+          f"{r.composite:>6} {r.composite_fine:>8.2f}{dest}")
+    if listed:
         w("")
         w("'=' marks an image scored at its own size because it was already at or")
         w(f"below the {SORT_TIER} tier. Q~ is informational; the score is min(B, D).")
@@ -1754,7 +1962,7 @@ def build_sort_report(args, folder: Path, results: list[Result],
     w(f"ALREADY IN PLACE  ({_fmt_int(len(present))} images)")
     w("-" * 66)
     for r in sorted(present, key=lambda r: r.name):
-        w(f"{r.name:<{name_w}}{SORT_DIR_PREFIX}{r.composite}/")
+        w(f"{r.name:<{name_w}}{r.sort_dirname}/")
     w("")
 
     w(f"DUPLICATES IN OTHER SCORE FOLDERS  ({len(stale)})")
@@ -1791,7 +1999,7 @@ def build_sort_report(args, folder: Path, results: list[Result],
     w("SUMMARY")
     w("=" * 66)
     w("")
-    w("SCORE DISTRIBUTION")
+    w("SCORE DISTRIBUTION (absolute 1-10, whatever the tiers end up being)")
     hist = defaultdict(int)
     for r in scored:
         hist[r.composite] += 1
@@ -1800,8 +2008,16 @@ def build_sort_report(args, folder: Path, results: list[Result],
         n = hist[score]
         bar = "#" * (round(40 * n / peak) if peak else 0)
         pct = 100.0 * n / max(len(scored), 1)
-        w(f"  {SORT_DIR_PREFIX}{score:<3} {bar:<40}  {_fmt_int(n):>8}  {pct:>5.1f}%")
+        w(f"  {score:>2}  {bar:<40}  {_fmt_int(n):>8}  {pct:>5.1f}%")
     w("")
+    if stage == STAGE_FINAL and dynamic and tiers:
+        w("TIER DISTRIBUTION")
+        peak = max((t.count for t in tiers), default=0)
+        for tier in tiers:
+            bar = "#" * (round(40 * tier.count / peak) if peak else 0)
+            pct = 100.0 * tier.count / max(len(scored), 1)
+            w(f"  {tier.name:<10} {bar:<40}  {_fmt_int(tier.count):>8}  {pct:>5.1f}%")
+        w("")
     w("TIMING")
     rate = len(results) / elapsed if elapsed > 0 else 0.0
     w(f"  scored   {_fmt_int(len(results))} images in {_hms(elapsed)} "
@@ -1893,6 +2109,26 @@ def _threshold_arg(value: str) -> int:
     return n
 
 
+def _sort_tiers_arg(value: str) -> int:
+    try:
+        n = int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--sort takes a number of quality tiers "
+            f"({MIN_QUALITY_TIERS}..{MAX_QUALITY_TIERS}) or nothing at all, "
+            f"got {value!r}")
+    if n < MIN_QUALITY_TIERS:
+        raise argparse.ArgumentTypeError(
+            f"--sort {n} would put every image in one place, which sorts "
+            f"nothing; use at least {MIN_QUALITY_TIERS} tiers, or bare --sort "
+            f"for absolute 1-10 scoring")
+    if n > MAX_QUALITY_TIERS:
+        raise argparse.ArgumentTypeError(
+            f"--sort {n} is more tiers than the score has room for; the "
+            f"maximum is {MAX_QUALITY_TIERS}")
+    return n
+
+
 def _threads_arg(value: str) -> int:
     try:
         n = int(value)
@@ -1923,12 +2159,19 @@ def parse_args(argv=None):
                    help="Worker threads, 1..32. Default 4.")
     p.add_argument("--force", action="store_true",
                    help="Overwrite existing outputs instead of skipping.")
-    p.add_argument("--sort", action="store_true",
+    p.add_argument("--sort", nargs="?", type=_sort_tiers_arg, metavar="N",
+                   const=SORT_ABSOLUTE, default=None,
                    help=f"Triage instead of building a dataset: score every "
                         f"image at the {SORT_TIER} tier and copy the ORIGINAL, "
-                        f"with its .txt sidecar, into _prep/"
-                        f"{SORT_DIR_PREFIX}1 .. _prep/{SORT_DIR_PREFIX}10 by "
-                        f"score. Writes no tier folders and no TOML.")
+                        f"with its .txt sidecar, into a folder for its quality. "
+                        f"Bare --sort files by absolute score into "
+                        f"{SORT_DIR_PREFIX}1..{SORT_DIR_PREFIX}10 "
+                        f"({SORT_DIR_PREFIX}10 best), and leaves empty whatever "
+                        f"the folder has none of. --sort N "
+                        f"({MIN_QUALITY_TIERS}..{MAX_QUALITY_TIERS}) instead "
+                        f"divides this folder into N populated tiers, "
+                        f"{QUALITY_DIR_PREFIX}1 best. Writes no tier folders "
+                        f"and no TOML.")
     p.add_argument("--move", action="store_true",
                    help="With --sort, move the originals instead of copying "
                         "them. This is the only k2prep option that removes "
@@ -1946,7 +2189,7 @@ def parse_args(argv=None):
                         f"and all.")
     p.add_argument("--version", action="version", version=f"k2prep {__version__}")
     args = p.parse_args(argv)
-    if args.move and not args.sort:
+    if args.move and args.sort is None:
         p.error("--move is only available with --sort; on its own it would have "
                 "nothing to move and would still delete your originals")
     return args
@@ -2015,27 +2258,56 @@ def run_sort(args, folder: Path, prep_dir: Path, reports_dir: Path,
                         r.status = ST_ERROR
                         r.error = f"{type(exc).__name__}: {exc}"
 
+    scored = [r for r in results if r.scored]
+    if todo:
+        save_score_cache(prep_dir, results, datetime.now())
+        notes.append(f"scores cached in {CACHE_FILENAME} "
+                     f"({cache_hits} of {len(todo)} reused this run).")
+
+    # -- preliminary report: the scores, before any decision about tiers -----
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = f"{started:%Y%m%d-%H%M%S}"
+    prelim_path = _free_path(reports_dir, f"sort-{stamp}-preliminary", ".txt")
+    prelim_path.write_text(
+        build_sort_report(args, folder, results, unknown, [], started,
+                          datetime.now(), time.perf_counter() - t0, notes,
+                          STAGE_PRELIMINARY, []),
+        encoding="utf-8",
+    )
+
+    # -- decide where each image goes ----------------------------------------
+    tiers: list[QualityTier] = []
+    if args.sort == SORT_ABSOLUTE:
+        for r in scored:
+            r.sort_tier = r.composite
+            r.sort_dirname = f"{SORT_DIR_PREFIX}{r.composite}"
+    else:
+        tiers = plan_quality_tiers(scored, args.sort)
+        empty = [t.name for t in tiers if t.count == 0]
+        if empty:
+            notes.append(f"only {len(scored)} images to divide, so "
+                         f"{', '.join(empty)} came out empty.")
+        tied = [t.name for t in tiers if t.tied_break]
+        if tied:
+            notes.append("a tier break fell between images of identical "
+                         f"quality ({', '.join(tied)}); the split there is "
+                         "arbitrary.")
+
     # -- place, sequentially: moving files is not worth parallelising ---------
     for r in results:
-        if r.scored and r.status != ST_ERROR:
+        if r.scored and r.status != ST_ERROR and r.sort_dirname:
             place_sorted(r, prep_dir, args.move, args.force, args.report)
     stale = find_stale_sorted(prep_dir, results)
 
     elapsed = time.perf_counter() - t0
     finished = datetime.now()
-
-    if todo:
-        save_score_cache(prep_dir, results, finished)
-        notes.append(f"scores cached in {CACHE_FILENAME} "
-                     f"({cache_hits} of {len(todo)} reused this run).")
     for note in notes:
         print(f"note: {note}")
 
-    reports_dir.mkdir(parents=True, exist_ok=True)
-    report_path = _free_path(reports_dir, f"sort-{started:%Y%m%d-%H%M%S}", ".txt")
+    report_path = _free_path(reports_dir, f"sort-{stamp}-final", ".txt")
     report_path.write_text(
         build_sort_report(args, folder, results, unknown, stale,
-                          started, finished, elapsed, notes),
+                          started, finished, elapsed, notes, STAGE_FINAL, tiers),
         encoding="utf-8",
     )
 
@@ -2044,17 +2316,21 @@ def run_sort(args, folder: Path, prep_dir: Path, reports_dir: Path,
         counts[r.sort_action] += 1
     errors = sum(1 for r in results
                  if r.status == ST_ERROR or r.sort_action == SORT_FAILED)
-    hist = defaultdict(int)
-    for r in results:
-        if r.scored:
-            hist[r.composite] += 1
 
     print()
     print(f"k2prep sort{' (dry run)' if args.report else ''}: "
           f"{len(results)} images in {_hms(elapsed)}")
-    for score in range(10, 0, -1):
-        if hist[score]:
-            print(f"  {SORT_DIR_PREFIX}{score:<3} {hist[score]:>7}")
+    if tiers:
+        for tier in tiers:
+            print(f"  {tier.name:<10} {tier.count:>7}"
+                  f"   {'score ' + _score_span(tier) if tier.count else ''}")
+    else:
+        hist = defaultdict(int)
+        for r in scored:
+            hist[r.composite] += 1
+        for score in range(10, 0, -1):
+            if hist[score]:
+                print(f"  {SORT_DIR_PREFIX}{score:<6} {hist[score]:>7}")
     verb = "moved " if args.move else "copied"
     print(f"  {verb}      {counts[SORT_COPIED] + counts[SORT_MOVED]:>7}"
           f"{'  (dry run: nothing placed)' if args.report else ''}")
@@ -2097,7 +2373,7 @@ def main(argv=None) -> int:
     ext = ".png" if args.png else ".jpg"
     resample = RESAMPLE_FILTERS[args.filter]
 
-    if args.sort:
+    if args.sort is not None:
         return run_sort(args, folder, prep_dir, reports_dir, images, unknown,
                         resample, started, t0)
 

@@ -65,7 +65,7 @@ k2prep.py <folder> [options]
 | `--force` | off | Overwrite existing outputs instead of skipping, and ignore the score cache. |
 | `--no-merge` | off | Skip bucket consolidation; leave every image in the bucket its own aspect ratio picks. |
 | `--single-pass` | off | Score the source and reject before rendering, instead of scoring the rendered result. |
-| `--sort` | off | Triage mode: score every image and file the **original** under `_prep/score1` … `_prep/score10`. Builds no dataset. |
+| `--sort [N]` | off | Triage mode: score every image and file the **original** by quality. Builds no dataset. Bare `--sort` uses absolute bands (`score1`…`score10`, 10 best); `--sort N` (2–10) cuts N populated tiers from this folder (`quality1` best). |
 | `--move` | off | With `--sort` only: move the originals instead of copying them. |
 
 `--report` and `--threshold` compose: `--report --threshold 7` shows what a
@@ -113,6 +113,55 @@ It writes no tier folders, no resized images and no TOML. The point is triage:
 see what you have, keep the good folders, then run k2prep normally on whichever
 of them you decide to train from.
 
+### `--sort N`: N tiers, cut from your folder
+
+Bare `--sort` uses absolute bands, so a folder of uniformly good photographs
+piles into two or three of the ten folders and the rest stay empty. Give it a
+number instead and it divides *that folder* into exactly N populated tiers,
+named `quality1` (best) through `qualityN`:
+
+```bash
+run.bat "L:\train\photos" --sort 3
+```
+
+```
+QUALITY TIERS  (3 tiers from 29 images)
+tier          images   share  score   quality         break
+quality1          13   44.8%  10-9    10.67-9.28      gap 0.89
+quality2           7   24.1%  8-7     8.39-7.42       gap 0.99
+quality3           9   31.0%  6-2     6.43-2.68       -
+```
+
+Three is the useful default — keep / maybe / discard.
+
+**Cuts are made by rank, not by absolute score.** That is what guarantees every
+tier is populated: a folder of uniformly excellent images still has a best third
+and a worst third, and being told all 400 are `score10` helps nobody. On a set
+where every image scores 9 or 10 absolutely, `--sort 3` still returns 5 / 3 / 5.
+
+Tiers are **not forced to equal size**. Each cut may slide up to 35% of a tier's
+width from its ideal position to settle on the largest natural break it can find
+there, so the split follows real structure in the data where there is any. The
+`break` column reports the size of the gap each cut landed on.
+
+That sliding window is also what stops **one or two outliers from defining a
+grade**. Given a single superb image among nine ordinary ones, `--sort 3` puts
+three images in `quality1`, not one — a cut cannot run away to a distant gap just
+because the gap is large.
+
+Ranking uses the composite score *plus its position inside that band* (the
+`quality` column). A 1–10 integer leaves at most ten distinct values, which is
+far too coarse to order a folder by; the fraction comes from where the
+measurement actually sits within its band, and the integer part is unchanged.
+
+If there are fewer images than tiers, the spare tiers are left empty and the
+report says so. If a cut has to fall between images of identical quality, it is
+flagged as arbitrary rather than passed off as a judgement.
+
+Each `--sort` run writes two reports: `sort-*-preliminary.txt` with the scores
+and the absolute 1–10 histogram, before any tier decision, and
+`sort-*-final.txt` with the tiers that were chosen and where everything went.
+
 **Every image is scored at the 1024 tier**, whatever tier the dataset pipeline
 would have put it in. "How good would this be as a training image" has one
 answer, and asking it at three different resolutions would make the scores
@@ -141,9 +190,9 @@ What it will not do:
 - Leave a hole. Each destination is written before its source is unlinked, so an
   interruption leaves a duplicate to clean up, never a missing file.
 - Delete a stale copy. If an earlier run filed the same image under a different
-  score, that copy is listed under `DUPLICATES IN OTHER SCORE FOLDERS` and left
-  alone — under `--move` it may be the only copy in existence. Clear those by
-  hand.
+  score — including a run in the other naming scheme — that copy is listed under
+  `DUPLICATES IN OTHER SCORE FOLDERS` and left alone; under `--move` it may be
+  the only copy in existence. Clear those by hand.
 
 `--move` without `--sort` is rejected outright.
 
